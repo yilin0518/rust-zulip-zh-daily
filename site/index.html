@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Rust 编程语言社区 Zulip 讨论的每日中文翻译（general / T-compiler / T-libs / T-opsem）">
+<title>Rust Zulip 中文日报</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='20' fill='%23d95f2b'/%3E%3Ctext x='50' y='68' font-size='52' font-weight='bold' text-anchor='middle' fill='white' font-family='monospace'%3ER%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="style.css">
+</head>
+<body data-lang="both">
+
+<header class="topbar">
+  <button id="menuBtn" class="menu-btn" aria-label="打开频道列表">&#9776;</button>
+  <div class="logo">
+    <div class="logo-mark">R</div>
+    <h1>Rust Zulip 中文日报</h1>
+    <span class="sub">general · T-compiler · T-libs · T-opsem</span>
+  </div>
+  <div class="topbar-right">
+    <span id="updatedAt"></span>
+    <div class="seg" id="langSeg">
+      <button data-lang="both" class="active">双语</button>
+      <button data-lang="zh">中文</button>
+      <button data-lang="en">English</button>
+    </div>
+  </div>
+</header>
+
+<div class="layout">
+  <aside id="sidebar">
+    <div class="sidebar-search">
+      <input id="search" type="search" placeholder="搜索话题（中/英文）…" autocomplete="off">
+    </div>
+    <nav id="streamNav"></nav>
+  </aside>
+
+  <main id="content">
+    <div id="backdrop" style="display:none"></div>
+    <div id="empty" class="empty">
+      <div class="empty-mark">R</div>
+      <div>从左侧选择一个话题，查看该话题的完整讨论（英文原文 + 中文翻译）</div>
+    </div>
+
+    <div id="topicView" class="topic-view" hidden>
+      <h2 id="topicTitle" class="topic-title"></h2>
+      <div id="topicTitleZh" class="topic-title-zh"></div>
+      <div id="topicMeta" class="topic-meta"></div>
+      <div id="messages"></div>
+    </div>
+  </main>
+</div>
+
+<footer class="footer">
+  <span>数据来源：<a href="https://rust-lang.zulipchat.com/" target="_blank" rel="noopener noreferrer">rust-lang Zulip</a>（公开频道）</span>
+  <span>每日自动更新 · 手动运行可在仓库 Actions 页点击 “Run workflow”</span>
+  <span><a id="repoLink" href="https://github.com/" target="_blank" rel="noopener noreferrer">项目源码</a></span>
+</footer>
+
+<script src="app.js"></script>
+</body>
+</html>
