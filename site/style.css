@@ -16,6 +16,8 @@
   --sender-color: #7a5b8e;
 }
 * { box-sizing: border-box; margin: 0; padding: 0; }
+/* 保证 hidden 属性始终生效（避免被 .empty 等 display 规则覆盖） */
+[hidden] { display: none !important; }
 html, body { height: 100%; }
 body {
   font-family: system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
