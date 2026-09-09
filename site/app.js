@@ -202,6 +202,15 @@ function renderMessages() {
   $("#topicMeta").textContent =
     `${t.count} 条消息 · 最后活跃 ${fmtFull(t.last)} · 最早 ${fmtFull(t.first)}`;
 
+  const summaryBox = $("#topicSummary");
+  if (t.summary) {
+    $("#summaryContent").innerHTML = md(t.summary);
+    summaryBox.hidden = false;
+  } else {
+    $("#summaryContent").textContent = "";
+    summaryBox.hidden = true;
+  }
+
   const box = $("#messages");
   box.innerHTML = "";
   for (const m of t.messages) {

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""翻译模块：支持多后端（Google / MyMemory / DeepL / 火山方舟 ARK），带翻译缓存。
+"""翻译模块：支持 OpenAI 兼容接口及备用翻译后端，带翻译缓存。
 
 翻译策略：先把文本按「纯文本 / 代码块 / 行内代码 / URL / 邮箱」拆成段，
 只翻译纯文本段（必要时按句子边界分块），代码与链接原样保留——避免翻译引擎破坏代码。
@@ -8,14 +8,15 @@
 健壮性设计（2026-09 修订，修复云端挂起问题）：
 - 启动时对每个后端做健康探测（probe），探测失败的后端本次运行直接跳过；
 - 所有后端探测均失败时立即报错退出（保留上一次已部署的数据，避免静默产出英文站）；
-- 单请求超时从 30s 降到 12s（ARK 30s），重试次数从 3 降到 2，并设置全局 socket 超时；
+- 普通翻译请求超时 12s，OpenAI 兼容请求超时 120s，并带有限重试；
 - 运行中某后端连续失败会被标记为失效，不再反复慢速重试。
 
 环境变量：
-  TRANSLATE_BACKEND : google | mymemory | deepl | ark | auto（默认 auto：优先 google，失败自动降级 mymemory）
+  TRANSLATE_BACKEND : openai | google | mymemory | deepl | auto
+  OPENAI_API_KEY    : OpenAI 或第三方 OpenAI 兼容服务的 API Key
+  OPENAI_BASE_URL   : API 根地址，默认 https://api.openai.com/v1
+  OPENAI_MODEL      : 模型名称，由所使用的服务提供
   DEEPL_API_KEY     : DeepL API Key（免费 key 形如 xxxx:fx，使用 api-free.deepl.com）
-  ARK_API_KEY       : 火山方舟 API Key（OpenAI 兼容接口，质量最佳）
-  ARK_MODEL         : 火山方舟模型名或推理接入点 ID（如 doubao-seed-1-6-250615 或 ep-xxxxx）
   MYMEMORY_EMAIL    : MyMemory 邮箱参数（匿名每天 5000 字符；带邮箱每天 5 万字符）
 """
 import json
@@ -45,13 +46,13 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 
 # Google 单请求可承载较长文本，用大块减少请求数；MyMemory 单次 500 字符上限
 GOOGLE_CHUNK_LIMIT = 2000
-ARK_CHUNK_LIMIT = 4000  # ARK 上下文窗口大，用更大块减少调用次数
+OPENAI_CHUNK_LIMIT = 4000
 DEFAULT_CHUNK_LIMIT = 450
 TIMEOUT = 12
 ATTEMPTS = 2
 
 # 请求节流：成功调用后的等待秒数（实测 Google 在 GitHub 运行器上 0.5s/次 稳定 60/60）
-PACING = {"google": 0.5, "mymemory": 0.25, "deepl": 0.15, "ark": 0.1}
+PACING = {"google": 0.5, "mymemory": 0.25, "deepl": 0.15, "openai": 0.1}
 # 后端连续失败次数达到该值后，本次运行禁用（防止持久性故障拖慢整体）
 DEAD_AFTER_CONSEC = 5
 # 连续失败后的冷却（秒）：15s, 30s, 45s … 指数增长
@@ -286,69 +287,74 @@ class DeepLTranslator:
             raise TranslationError("deepl 错误: %s" % e)
 
 
-class ARKTranslator:
-    """火山方舟（豆包）OpenAI 兼容接口，翻译质量最好。"""
-    name = "ark"
-    URL = "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
+class OpenAITranslator:
+    """OpenAI Chat Completions 兼容客户端，可连接官方或第三方服务。"""
+    name = "openai"
 
     def __init__(self):
-        self.key = os.environ.get("ARK_API_KEY", "").strip()
-        self.model = os.environ.get("ARK_MODEL", "").strip()
+        self.key = os.environ.get("OPENAI_API_KEY", "").strip()
+        self.model = os.environ.get("OPENAI_MODEL", "").strip()
+        base = os.environ.get("OPENAI_BASE_URL", "").strip() or "https://api.openai.com/v1"
+        self.url = base if base.rstrip("/").endswith("/chat/completions") else base.rstrip("/") + "/chat/completions"
         if not self.key or not self.model:
-            raise TranslationError("缺少 ARK_API_KEY / ARK_MODEL")
+            raise TranslationError("缺少 OPENAI_API_KEY / OPENAI_MODEL")
 
-    def translate_one(self, text):
+    def complete(self, messages):
         payload = json.dumps({
             "model": self.model,
-            "messages": [
-                {"role": "system", "content": (
-                    "你是专业翻译。把用户提供的英文（来自 Rust 编程语言社区聊天）翻译成自然、"
-                    "地道的简体中文。代码、标识符、文件名、URL、邮箱保持原样。只输出译文，不要任何解释。")},
-                {"role": "user", "content": text},
-            ],
-            "temperature": 0.2,
-            "thinking": {"type": "disabled"},  # 关闭推理：翻译任务不需要思考链，显著降低时延
+            "messages": messages,
         }).encode("utf-8")
         for attempt in range(2):
             try:
                 req = urllib.request.Request(
-                    self.URL, data=payload, headers={
+                    self.url, data=payload, headers={
                         "Authorization": "Bearer " + self.key,
                         "Content-Type": "application/json", "User-Agent": UA})
                 with urllib.request.urlopen(req, timeout=120) as r:
                     parsed = json.loads(r.read().decode("utf-8", "replace"))
-                return parsed["choices"][0]["message"]["content"].strip()
+                content = parsed["choices"][0]["message"]["content"]
+                if not isinstance(content, str) or not content.strip():
+                    raise TranslationError("openai 返回空结果")
+                return content.strip()
             except urllib.error.HTTPError as e:
                 if e.code in (429, 500, 502, 503) and attempt < 1:
                     time.sleep(2)
                     continue
-                raise TranslationError("ark http %s: %s" % (e.code, e.read()[:200]))
+                raise TranslationError("openai http %s: %s" % (e.code, e.read()[:200]))
             except (urllib.error.URLError, ValueError, KeyError, OSError) as e:
                 if attempt < 1:
                     time.sleep(1)
                     continue
-                raise TranslationError("ark 错误: %s" % e)
-        raise TranslationError("ark 失败")
+                raise TranslationError("openai 错误: %s" % e)
+        raise TranslationError("openai 失败")
+
+    def translate_one(self, text):
+        return self.complete([
+            {"role": "system", "content": (
+                "你是专业翻译。把用户提供的英文（来自 Rust 编程语言社区聊天）翻译成自然、"
+                "地道的简体中文。代码、标识符、文件名、URL、邮箱保持原样。只输出译文，不要任何解释。")},
+            {"role": "user", "content": text},
+        ])
 
 
 def build_backends():
     """按优先级返回后端列表。TRANSLATE_BACKEND 显式指定时只用该后端（无降级链）；
-    auto（默认）时：配置了 ARK 则 [ARK, google, mymemory]，否则 [google, mymemory]。"""
+    auto（默认）时：配置了 OpenAI 则优先使用，否则使用 google + mymemory。"""
     name = (os.environ.get("TRANSLATE_BACKEND") or "auto").strip().lower()
     if name == "deepl":
         return [DeepLTranslator()]
-    if name == "ark":
-        return [ARKTranslator()]
+    if name == "openai":
+        return [OpenAITranslator()]
     if name == "mymemory":
         return [MyMemoryTranslator()]
     if name == "google":
         return [GoogleTranslator()]
     backends = [GoogleTranslator(), MyMemoryTranslator()]
     try:
-        ark = ARKTranslator()
-        backends = [ark] + backends
+        openai = OpenAITranslator()
+        backends = [openai] + backends
     except TranslationError:
-        pass  # 未配置 ARK：走 google + mymemory
+        pass
     return backends
 
 
@@ -415,15 +421,15 @@ class Translator:
                 print("[backend] %s 可用 (探测: %s)" % (b.name, out.strip()[:40]), flush=True)
                 if b.name == "google":
                     self._chunk_limit = GOOGLE_CHUNK_LIMIT
-                elif b.name == "ark":
-                    self._chunk_limit = ARK_CHUNK_LIMIT
+                elif b.name == "openai":
+                    self._chunk_limit = OPENAI_CHUNK_LIMIT
             else:
                 self._dead[b.name] = True
                 print("[backend] %s 不可用，本次运行跳过" % b.name, flush=True)
         alive_names = [n for n, a in self._dead.items() if not a]
         if not alive_names:
             raise TranslationError(
-                "所有翻译后端均不可用（%s）。请检查网络，或配置 DEEPL_API_KEY / ARK_API_KEY。"
+                "所有翻译后端均不可用（%s）。请检查网络，或配置 OPENAI_API_KEY / OPENAI_MODEL。"
                 % ",".join(self._dead.keys()))
         print("[backend] 本次运行使用: %s（分块上限 %d 字符，节流 %ss）"
               % (",".join(alive_names), self._chunk_limit, PACING.get(alive_names[0], 0.2)),
@@ -485,14 +491,14 @@ class Translator:
         self.stats["failed"] += 1
         return seg  # 全部失败：保留原文，下轮再试
 
-    # ---------------- 批量翻译（ARK） ----------------
+    # ---------------- 批量翻译（OpenAI 兼容接口） ----------------
     _MARKER_RE = re.compile(r"【消息#(\d+)】\s*", re.MULTILINE)
 
     def translate_batch(self, items, max_msgs=20, max_chars=8000):
         """批量翻译多条文本，返回 {cache_key: zh}。
 
         items: [(cache_key, text), ...]
-        命中缓存直接返回；未命中时若 ARK 可用则合并为一个请求翻译（标记模板 + 逐条解析），
+        命中缓存直接返回；未命中时若 OpenAI 可用则合并为一个请求翻译（标记模板 + 逐条解析），
         解析失败的消息回退到逐条翻译。逐条写缓存，保持增量更新能力。
         """
         result = {}
@@ -509,24 +515,24 @@ class Translator:
             todo.append((key, text))
         if not todo:
             return result
-        ark = next((b for b in self.backends
-                    if b.name == "ark" and not self._dead.get(b.name)), None)
-        if ark is None:
+        ai = next((b for b in self.backends
+                   if b.name == "openai" and not self._dead.get(b.name)), None)
+        if ai is None:
             for key, text in todo:
                 result[key] = self.translate(text, cache_key=key)
             return result
         batch, chars = [], 0
         for key, text in todo:
             if len(batch) >= max_msgs or (batch and chars + len(text) > max_chars):
-                self._flush_batch(ark, batch, result)
+                self._flush_batch(ai, batch, result)
                 batch, chars = [], 0
             batch.append((key, text))
             chars += len(text)
         if batch:
-            self._flush_batch(ark, batch, result)
+            self._flush_batch(ai, batch, result)
         return result
 
-    def _flush_batch(self, ark, batch, result):
+    def _flush_batch(self, ai, batch, result):
         numbered = ["【消息#%d】\n%s" % (i, text) for i, (_, text) in enumerate(batch, 1)]
         prompt = ("以下是来自 Rust 编程语言社区的多条英文消息，请逐条翻译成自然、地道的简体中文。"
                   "代码、标识符、文件名、URL、邮箱保持原样。"
@@ -534,18 +540,18 @@ class Translator:
                   "标记后接该条译文。不要输出任何其他内容。\n\n"
                   + "\n".join(numbered))
         try:
-            out = ark.translate_one(prompt)
+            out = ai.translate_one(prompt)
             parsed = self._parse_batch(out, len(batch))
         except TranslationError:
             parsed = {}
-        self.stats["backend"]["ark"] = self.stats["backend"].get("ark", 0) + 1
+        self.stats["backend"]["openai"] = self.stats["backend"].get("openai", 0) + 1
         self.stats["chars"] += sum(len(text) for _, text in batch)
         for i, (key, text) in enumerate(batch, 1):
             zh = parsed.get(i)
             if zh:
                 zh = apply_simp(apply_glossary(zh)).strip()
                 result[key] = zh
-                self.cache.put(key, text, zh, "ark")
+                self.cache.put(key, text, zh, "openai")
             else:
                 # 该条解析失败/缺失：回退逐条翻译
                 result[key] = self.translate(text, cache_key=key)

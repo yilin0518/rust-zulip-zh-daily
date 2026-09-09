@@ -31,13 +31,13 @@ jobs:
           ZULIP_API_KEY: ${{ secrets.ZULIP_API_KEY }}
           TOPICS_PER_STREAM: ${{ vars.TOPICS_PER_STREAM }}
           STREAMS: ${{ vars.STREAMS }}
-          TRANSLATE_BACKEND: ${{ vars.TRANSLATE_BACKEND }}
+          TRANSLATE_BACKEND: 'openai'
           TRANSLATE_BUDGET_MIN: '240'
-          DEEPL_API_KEY: ${{ secrets.DEEPL_API_KEY }}
-          ARK_API_KEY: ${{ secrets.ARK_API_KEY }}
-          ARK_MODEL: ${{ secrets.ARK_MODEL }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_BASE_URL: ${{ vars.OPENAI_BASE_URL }}
+          OPENAI_MODEL: ${{ vars.OPENAI_MODEL }}
 
-      - name: 提交翻译缓存（避免下次重复翻译）
+      - name: 提交翻译与总结缓存（避免重复调用 AI）
         run: |
           git config user.name "rust-zulip-daily-bot"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"

@@ -116,6 +116,21 @@ a:hover { text-decoration: underline; }
 .topic-title-zh { font-size: 13.5px; color: var(--muted); margin-top: 4px; }
 .topic-meta { font-size: 12px; color: var(--muted); margin-top: 8px; padding-bottom: 14px; border-bottom: 1px solid var(--border); }
 
+.topic-summary {
+  margin: 16px 0 4px; padding: 14px 16px;
+  background: var(--accent-soft); border: 1px solid #f1cdb7; border-radius: 10px;
+}
+.summary-heading { display: flex; align-items: center; gap: 8px; font-weight: 700; margin-bottom: 7px; }
+.summary-mark {
+  display: inline-flex; align-items: center; justify-content: center;
+  min-width: 28px; height: 20px; padding: 0 5px; border-radius: 5px;
+  background: var(--accent); color: #fff; font-size: 10px; letter-spacing: .4px;
+}
+.summary-content { font-size: 13.5px; }
+.summary-content p { margin: 3px 0; }
+.summary-content ul, .summary-content ol { margin: 4px 0 4px 20px; }
+.summary-content li { margin: 3px 0; }
+
 .msg { padding: 14px 0; border-bottom: 1px solid var(--border); }
 .msg-head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 6px; }
 .msg-head .sender { font-weight: 650; color: var(--sender-color); font-size: 13.5px; }

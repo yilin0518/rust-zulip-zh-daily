@@ -20,6 +20,7 @@ streams = {
         "topics": [
             {"name": "Welcome to the Rust community",
              "name_zh": "欢迎来到 Rust 社区",
+             "summary": "- 社区欢迎新成员加入 Rust Zulip。\n- 提醒新成员阅读社区行为准则。",
              "messages": [
                  msg(1001, "Alice", "欢迎来到 Rust Zulip！请阅读行为准则。",
                      "Welcome to the Rust Zulip! Please read the code of conduct."),
@@ -28,6 +29,7 @@ streams = {
              ]},
             {"name": "What are you working on?",
              "name_zh": "你最近在做什么？",
+             "summary": "- Carol 正在使用 Rust 开发文本编辑器。\n- 在 egui 与 TUI 之间选择后，目前倾向使用 `ratatui` 构建 TUI。",
              "messages": [
                  msg(1003, "Carol", "我正在做一个用 Rust 写的文本编辑器。",
                      "I'm working on a text editor written in Rust."),
@@ -43,6 +45,7 @@ streams = {
         "topics": [
             {"name": "Proposal: improve borrow checker diagnostics",
              "name_zh": "提案：改进借用检查器的诊断信息",
+             "summary": "- 讨论如何让借用检查器错误信息更容易被新手理解。\n- 建议参考现有快照测试，并以不可变借用冲突作为典型案例。",
              "messages": [
                  msg(2001, "CompilerGuy", "我想改进借用检查器的错误信息，让新手更容易理解。",
                      "I'd like to improve the borrow checker error messages so beginners can understand them."),
@@ -55,6 +58,7 @@ streams = {
              ]},
             {"name": "RFC discussion: async fn in traits",
              "name_zh": "RFC 讨论：trait 中的 async fn",
+             "summary": "- 确认 trait 中的 `async fn` 相关 RFC 已合并。\n- 对应实现仍在推进中。",
              "messages": [
                  msg(2005, "AsyncFan", "我们终于要实现 trait 中的 async fn 了吗？参见 https://github.com/rust-lang/rfcs 。",
                      "Are we finally getting async fn in traits? See https://github.com/rust-lang/rfcs ."),
@@ -68,6 +72,7 @@ streams = {
         "topics": [
             {"name": "Stabilization request: OnceLock",
              "name_zh": "稳定性申请：OnceLock",
+             "summary": "- 讨论稳定 `std::sync::OnceLock`。\n- API 获得初步认可，下一步进入 FCP。",
              "messages": [
                  msg(3001, "LibDev", "我们想申请稳定 `std::sync::OnceLock`。",
                      "We'd like to stabilize `std::sync::OnceLock`."),
@@ -81,6 +86,7 @@ streams = {
         "topics": [
             {"name": "Modeling provenance in Stacked Borrows",
              "name_zh": "在 Stacked Borrows 中建模 provenance",
+             "summary": "- 讨论 Stacked Borrows 中 provenance 的建模方式。\n- 核心问题是重新借用后原引用的有效性，初步观点区分 `&mut` 与 `&`。",
              "messages": [
                  msg(4001, "Ralf", "关于 Stacked Borrows 中的 provenance 建模，我有一个新想法。",
                      "I have a new idea about modeling provenance in Stacked Borrows."),

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""每日管线：拉取 rust-lang Zulip 指定频道最新话题 → 翻译为中文 → 生成 site/data/*.json。
+"""每日管线：拉取 Zulip 话题 → 翻译与 AI 总结 → 生成站点数据。
 
 用法：
     python scripts/pipeline.py
@@ -8,11 +8,13 @@
     ZULIP_EMAIL / ZULIP_API_KEY   必填，Zulip bot 凭据
     TOPICS_PER_STREAM             每个频道最新话题数，默认 20
     STREAMS                       可选，逗号分隔的频道名，默认 general,t-compiler,t-libs,t-opsem
-    TRANSLATE_BACKEND 等          见 translate.py
+    OPENAI_API_KEY / OPENAI_MODEL 必填，翻译与总结共用
+    OPENAI_BASE_URL               可选，第三方 OpenAI 兼容服务地址
 输出：
     site/data/<频道>.json         站点数据（双语）
     site/data/meta.json           元信息
     data/translation_cache.json   翻译缓存（需提交到仓库，避免重复翻译）
+    data/summary_cache.json       帖子总结缓存
 """
 import json
 import os
@@ -21,6 +23,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from translate import Cache, Translator  # noqa: E402
+from summarize import Summarizer  # noqa: E402
 from zulip_client import ZulipClient  # noqa: E402
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -60,6 +63,7 @@ def main():
     cache = Cache()
     try:
         tr = Translator(cache)
+        summarizer = Summarizer()
     except Exception as e:
         sys.exit("错误：翻译后端初始化失败——%s" % e)
 
@@ -111,10 +115,12 @@ def main():
             for mid, md in msg_meta.items():
                 md["zh"] = md.get("zh", zhs.get(mid, ""))
                 out_msgs.append(md)
+            summary = summarizer.summarize(name, t["name"], msgs)
             title_zh = tr.translate(t["name"], cache_key="t|%s|%s" % (name, t["name"]))
             out_topics.append({
                 "name": t["name"],
                 "name_zh": title_zh,
+                "summary": summary,
                 "count": len(out_msgs),
                 "first": t["first"],
                 "last": t["last"],
@@ -139,10 +145,12 @@ def main():
     with open(os.path.join(SITE_DATA, "meta.json"), "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False)
     cache.save()
+    summarizer.cache.save()
 
     print("\n完成：%d 个频道, %d 个话题, %d 条消息" % (len(streams_cfg), total_topics, total_msgs), flush=True)
     print("翻译后端: %s  翻译字符数: %d  失败保留原文: %d" % (
         tr.stats["backend"], tr.stats["chars"], tr.stats["failed"]), flush=True)
+    print("AI 总结: 新生成 %d，失败 %d" % (summarizer.generated, summarizer.failed), flush=True)
     if budget_exhausted():
         print("[warn] 翻译时间预算（%s 分钟）已耗尽，部分消息保留英文原文" % budget_min, flush=True)
     print("站点数据已写入 %s" % SITE_DATA, flush=True)
