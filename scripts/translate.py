@@ -322,6 +322,8 @@ class ARKTranslator:
 
 
 def build_backends():
+    """按优先级返回后端列表。TRANSLATE_BACKEND 显式指定时只用该后端（无降级链）；
+    auto（默认）时：配置了 ARK 则 [ARK, google, mymemory]，否则 [google, mymemory]。"""
     name = (os.environ.get("TRANSLATE_BACKEND") or "auto").strip().lower()
     if name == "deepl":
         return [DeepLTranslator()]
@@ -329,7 +331,15 @@ def build_backends():
         return [ARKTranslator()]
     if name == "mymemory":
         return [MyMemoryTranslator()]
-    return [GoogleTranslator(), MyMemoryTranslator()]  # google / auto
+    if name == "google":
+        return [GoogleTranslator()]
+    backends = [GoogleTranslator(), MyMemoryTranslator()]
+    try:
+        ark = ARKTranslator()
+        backends = [ark] + backends
+    except TranslationError:
+        pass  # 未配置 ARK：走 google + mymemory
+    return backends
 
 
 # ---------------- 缓存 ----------------
@@ -393,7 +403,7 @@ class Translator:
                 ok = False
             if ok:
                 print("[backend] %s 可用 (探测: %s)" % (b.name, out.strip()[:40]), flush=True)
-                if b.name == "google":
+                if b.name in ("google", "ark"):
                     self._chunk_limit = GOOGLE_CHUNK_LIMIT
             else:
                 self._dead[b.name] = True
@@ -416,6 +426,7 @@ class Translator:
             hit = self.cache.get(cache_key, text)
             if hit is not None:
                 return hit
+        before = sum(self.stats["backend"].values())
         segments = split_segments(text)
         outs = []
         for seg, keep in segments:
@@ -425,7 +436,10 @@ class Translator:
                 translated = [self._translate_seg(c) for c in _chunk(seg, self._chunk_limit)]
                 outs.append("".join(translated))
         zh = apply_simp(apply_glossary("".join(outs))).strip()
-        if cache_key is not None:
+        # 只有实际发生了翻译（至少一次后端成功）才写缓存；
+        # 失败的翻译若写入缓存会把英文当译文缓存，导致下次运行跳过重译。
+        translated_any = sum(self.stats["backend"].values()) > before
+        if cache_key is not None and translated_any:
             self.cache.put(cache_key, text, zh, self._last_backend)
         return zh
 
