@@ -47,7 +47,8 @@ def main():
     if not email or not api_key:
         sys.exit("错误：缺少环境变量 ZULIP_EMAIL / ZULIP_API_KEY（请用 Zulip bot 凭据，见 README）")
 
-    limit = int(os.environ.get("TOPICS_PER_STREAM", "20"))
+    topics_env = os.environ.get("TOPICS_PER_STREAM", "").strip()
+    limit = int(topics_env) if topics_env else 20
     streams_cfg = DEFAULT_STREAMS
     if os.environ.get("STREAMS"):
         streams_cfg = [{"key": s.strip(), "display": s.strip().title()}
