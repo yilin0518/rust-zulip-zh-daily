@@ -303,23 +303,32 @@ class ARKTranslator:
             "messages": [
                 {"role": "system", "content": (
                     "你是专业翻译。把用户提供的英文（来自 Rust 编程语言社区聊天）翻译成自然、"
-                    "地道的简体中文。代码、标识符、文件名、URL 保持原样。只输出译文，不要任何解释。")},
+                    "地道的简体中文。代码、标识符、文件名、URL、邮箱保持原样。只输出译文，不要任何解释。")},
                 {"role": "user", "content": text},
             ],
             "temperature": 0.2,
+            "thinking": {"type": "disabled"},  # 关闭推理：翻译任务不需要思考链，显著降低时延
         }).encode("utf-8")
-        req = urllib.request.Request(
-            self.URL, data=payload, headers={
-                "Authorization": "Bearer " + self.key,
-                "Content-Type": "application/json", "User-Agent": UA})
-        try:
-            with urllib.request.urlopen(req, timeout=30) as r:
-                parsed = json.loads(r.read().decode("utf-8", "replace"))
-            return parsed["choices"][0]["message"]["content"].strip()
-        except urllib.error.HTTPError as e:
-            raise TranslationError("ark http %s: %s" % (e.code, e.read()[:200]))
-        except (urllib.error.URLError, ValueError, KeyError, OSError) as e:
-            raise TranslationError("ark 错误: %s" % e)
+        for attempt in range(2):
+            try:
+                req = urllib.request.Request(
+                    self.URL, data=payload, headers={
+                        "Authorization": "Bearer " + self.key,
+                        "Content-Type": "application/json", "User-Agent": UA})
+                with urllib.request.urlopen(req, timeout=120) as r:
+                    parsed = json.loads(r.read().decode("utf-8", "replace"))
+                return parsed["choices"][0]["message"]["content"].strip()
+            except urllib.error.HTTPError as e:
+                if e.code in (429, 500, 502, 503) and attempt < 1:
+                    time.sleep(2)
+                    continue
+                raise TranslationError("ark http %s: %s" % (e.code, e.read()[:200]))
+            except (urllib.error.URLError, ValueError, KeyError, OSError) as e:
+                if attempt < 1:
+                    time.sleep(1)
+                    continue
+                raise TranslationError("ark 错误: %s" % e)
+        raise TranslationError("ark 失败")
 
 
 def build_backends():
@@ -475,3 +484,83 @@ class Translator:
                 time.sleep(0.2)
         self.stats["failed"] += 1
         return seg  # 全部失败：保留原文，下轮再试
+
+    # ---------------- 批量翻译（ARK） ----------------
+    _MARKER_RE = re.compile(r"【消息#(\d+)】\s*", re.MULTILINE)
+
+    def translate_batch(self, items, max_msgs=20, max_chars=8000):
+        """批量翻译多条文本，返回 {cache_key: zh}。
+
+        items: [(cache_key, text), ...]
+        命中缓存直接返回；未命中时若 ARK 可用则合并为一个请求翻译（标记模板 + 逐条解析），
+        解析失败的消息回退到逐条翻译。逐条写缓存，保持增量更新能力。
+        """
+        result = {}
+        todo = []
+        for key, text in items:
+            text = (text or "").strip()
+            if not text:
+                result[key] = ""
+                continue
+            hit = self.cache.get(key, text)
+            if hit is not None:
+                result[key] = hit
+                continue
+            todo.append((key, text))
+        if not todo:
+            return result
+        ark = next((b for b in self.backends
+                    if b.name == "ark" and not self._dead.get(b.name)), None)
+        if ark is None:
+            for key, text in todo:
+                result[key] = self.translate(text, cache_key=key)
+            return result
+        batch, chars = [], 0
+        for key, text in todo:
+            if len(batch) >= max_msgs or (batch and chars + len(text) > max_chars):
+                self._flush_batch(ark, batch, result)
+                batch, chars = [], 0
+            batch.append((key, text))
+            chars += len(text)
+        if batch:
+            self._flush_batch(ark, batch, result)
+        return result
+
+    def _flush_batch(self, ark, batch, result):
+        numbered = ["【消息#%d】\n%s" % (i, text) for i, (_, text) in enumerate(batch, 1)]
+        prompt = ("以下是来自 Rust 编程语言社区的多条英文消息，请逐条翻译成自然、地道的简体中文。"
+                  "代码、标识符、文件名、URL、邮箱保持原样。"
+                  "输出格式：每条译文前必须保留输入中的标记（如【消息#1】），一行一个标记，"
+                  "标记后接该条译文。不要输出任何其他内容。\n\n"
+                  + "\n".join(numbered))
+        try:
+            out = ark.translate_one(prompt)
+            parsed = self._parse_batch(out, len(batch))
+        except TranslationError:
+            parsed = {}
+        self.stats["backend"]["ark"] = self.stats["backend"].get("ark", 0) + 1
+        self.stats["chars"] += sum(len(text) for _, text in batch)
+        for i, (key, text) in enumerate(batch, 1):
+            zh = parsed.get(i)
+            if zh:
+                zh = apply_simp(apply_glossary(zh)).strip()
+                result[key] = zh
+                self.cache.put(key, text, zh, "ark")
+            else:
+                # 该条解析失败/缺失：回退逐条翻译
+                result[key] = self.translate(text, cache_key=key)
+        time.sleep(0.1)
+
+    def _parse_batch(self, out, n):
+        """解析 '【消息#N】译文' 输出，返回 {N: 译文}。损坏或缺失的项不返回。"""
+        parts = self._MARKER_RE.split(out)
+        res = {}
+        for i in range(1, len(parts) - 1, 2):
+            try:
+                idx = int(parts[i])
+            except ValueError:
+                continue
+            text = (parts[i + 1] or "").strip()
+            if 1 <= idx <= n and text:
+                res[idx] = text
+        return res

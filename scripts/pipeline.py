@@ -88,29 +88,29 @@ def main():
         out_topics = []
         for ti, t in enumerate(topics, 1):
             msgs = client.get_topic_messages(sid, t["name"])
-            out_msgs = []
+            pairs = []       # [(msg_id, en)] 待翻译
+            meta_by_id = {}  # msg_id -> 消息元数据
             for m in msgs:
                 en = (m.get("content") or "").strip()
                 if not en:
                     continue
-                if budget_exhausted():
-                    # 时间预算耗尽：不再翻译，剩余消息保留英文（站点仍可正常访问）
-                    out_msgs.append({
-                        "id": m["id"],
-                        "sender": m.get("sender_full_name") or "unknown",
-                        "time": m.get("timestamp"),
-                        "en": en,
-                        "zh": "",
-                    })
-                    continue
-                zh = tr.translate(en, cache_key=m["id"])
-                out_msgs.append({
+                meta = {
                     "id": m["id"],
                     "sender": m.get("sender_full_name") or "unknown",
                     "time": m.get("timestamp"),
                     "en": en,
-                    "zh": zh,
-                })
+                }
+                meta_by_id[m["id"]] = meta
+                if budget_exhausted():
+                    # 时间预算耗尽：不再翻译，剩余消息保留英文（站点仍可正常访问）
+                    meta["zh"] = ""
+                else:
+                    pairs.append((m["id"], en))
+            zhs = tr.translate_batch(pairs) if pairs else {}
+            out_msgs = []
+            for mid, meta in meta_by_id.items():
+                meta["zh"] = meta.get("zh", zhs.get(mid, ""))
+                out_msgs.append(meta)
             title_zh = tr.translate(t["name"], cache_key="t|%s|%s" % (name, t["name"]))
             out_topics.append({
                 "name": t["name"],
