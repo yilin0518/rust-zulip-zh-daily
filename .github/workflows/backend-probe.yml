@@ -1,0 +1,54 @@
+name: backend-probe
+on:
+  workflow_dispatch: {}
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: 探测 google 与 mymemory 行为
+        run: |
+          python3 - <<'EOF'
+          import urllib.request, urllib.parse, json, time
+          UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+          def google(text):
+              data = urllib.parse.urlencode([("client","gtx"),("sl","en"),("tl","zh-CN"),("dt","t"),("q",text)]).encode()
+              req = urllib.request.Request("https://translate.googleapis.com/translate_a/single",
+                                           data=data, headers={"User-Agent":UA})
+              with urllib.request.urlopen(req, timeout=15) as r:
+                  raw = r.read().decode("utf-8","replace")
+              if "Sorry" in raw or raw.lstrip().startswith("<html"): return "BLOCKED"
+              p = json.loads(raw)
+              return (p[0][0][0] if p and p[0] and p[0][0] else "")
+          def mymemory(text):
+              url = "https://api.mymemory.translated.net/get?" + urllib.parse.urlencode(
+                  [("q",text),("langpair","en|zh-CN"),("de","rust-zulip-daily@users.noreply.github.com")])
+              req = urllib.request.Request(url, headers={"User-Agent":UA})
+              with urllib.request.urlopen(req, timeout=15) as r:
+                  p = json.loads(r.read().decode("utf-8","replace"))
+              return (p.get("responseData",{}).get("translatedText",""), p.get("responseStatus"), p.get("responseDetails"))
+          ok=0; errs={}; t0=time.time()
+          for i in range(60):
+              try:
+                  out = google("This is test message number %d about the Rust programming language compiler." % i)
+                  if out: ok += 1
+                  else: errs["empty"] = errs.get("empty",0)+1
+              except Exception as e:
+                  errs[type(e).__name__ + ":" + str(getattr(e,'code',''))] = errs.get(type(e).__name__ + ":" + str(getattr(e,'code','')),0)+1
+              time.sleep(0.5)
+          print("GOOGLE_60: ok=%d errs=%s (%.0fs)" % (ok, errs, time.time()-t0))
+          ok=0; errs={}; t0=time.time()
+          for i in range(60):
+              try:
+                  out, st, det = mymemory("This is test message number %d about the Rust programming language." % i)
+                  if out: ok += 1
+                  else: errs["empty:%s:%s"%(st,det)] = errs.get("empty:%s:%s"%(st,det),0)+1
+              except Exception as e:
+                  errs[type(e).__name__] = errs.get(type(e).__name__,0)+1
+              time.sleep(0.2)
+          print("MYMEMORY_60: ok=%d errs=%s (%.0fs)" % (ok, errs, time.time()-t0))
+          EOF
