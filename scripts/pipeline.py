@@ -49,6 +49,8 @@ def main():
 
     topics_env = os.environ.get("TOPICS_PER_STREAM", "").strip()
     limit = int(topics_env) if topics_env else 20
+    budget_env = os.environ.get("TRANSLATE_BUDGET_MIN", "").strip()
+    budget_min = float(budget_env) if budget_env else 50.0  # 翻译总时间预算（分钟）
     streams_cfg = DEFAULT_STREAMS
     if os.environ.get("STREAMS"):
         streams_cfg = [{"key": s.strip(), "display": s.strip().title()}
@@ -56,9 +58,17 @@ def main():
 
     client = ZulipClient(email, api_key)
     cache = Cache()
-    tr = Translator(cache)
+    try:
+        tr = Translator(cache)
+    except Exception as e:
+        sys.exit("错误：翻译后端初始化失败——%s" % e)
 
-    print("正在获取频道列表…")
+    t0 = time.time()
+
+    def budget_exhausted():
+        return (time.time() - t0) / 60.0 > budget_min
+
+    print("正在获取频道列表…", flush=True)
     stream_ids = client.get_streams()
     os.makedirs(SITE_DATA, exist_ok=True)
 
@@ -76,12 +86,22 @@ def main():
             continue
         topics = client.get_latest_topics(sid, limit=limit)
         out_topics = []
-        for t in topics:
+        for ti, t in enumerate(topics, 1):
             msgs = client.get_topic_messages(sid, t["name"])
             out_msgs = []
             for m in msgs:
                 en = (m.get("content") or "").strip()
                 if not en:
+                    continue
+                if budget_exhausted():
+                    # 时间预算耗尽：不再翻译，剩余消息保留英文（站点仍可正常访问）
+                    out_msgs.append({
+                        "id": m["id"],
+                        "sender": m.get("sender_full_name") or "unknown",
+                        "time": m.get("timestamp"),
+                        "en": en,
+                        "zh": "",
+                    })
                     continue
                 zh = tr.translate(en, cache_key=m["id"])
                 out_msgs.append({
@@ -100,6 +120,9 @@ def main():
                 "last": t["last"],
                 "messages": out_msgs,
             })
+            print("[progress] %s 话题 %d/%d: %s (%d 条) 已用 %.1f 分钟"
+                  % (name, ti, len(topics), t["name"][:50], len(out_msgs),
+                     (time.time() - t0) / 60.0), flush=True)
 
         stream_data = {"stream": name, "display": cfg["display"], "topics": out_topics}
         with open(os.path.join(SITE_DATA, name + ".json"), "w", encoding="utf-8") as f:
@@ -111,16 +134,18 @@ def main():
         })
         total_topics += len(out_topics)
         total_msgs += msg_count
-        print("[ok] %s: %d 个话题, %d 条消息" % (name, len(out_topics), msg_count))
+        print("[ok] %s: %d 个话题, %d 条消息" % (name, len(out_topics), msg_count), flush=True)
 
     with open(os.path.join(SITE_DATA, "meta.json"), "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False)
     cache.save()
 
-    print("\n完成：%d 个频道, %d 个话题, %d 条消息" % (len(streams_cfg), total_topics, total_msgs))
+    print("\n完成：%d 个频道, %d 个话题, %d 条消息" % (len(streams_cfg), total_topics, total_msgs), flush=True)
     print("翻译后端: %s  翻译字符数: %d  失败保留原文: %d" % (
-        tr.stats["backend"], tr.stats["chars"], tr.stats["failed"]))
-    print("站点数据已写入 %s" % SITE_DATA)
+        tr.stats["backend"], tr.stats["chars"], tr.stats["failed"]), flush=True)
+    if budget_exhausted():
+        print("[warn] 翻译时间预算（%s 分钟）已耗尽，部分消息保留英文原文" % budget_min, flush=True)
+    print("站点数据已写入 %s" % SITE_DATA, flush=True)
 
 
 if __name__ == "__main__":

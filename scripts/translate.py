@@ -5,6 +5,12 @@
 翻译策略：先把文本按「纯文本 / 代码块 / 行内代码 / URL / 邮箱」拆成段，
 只翻译纯文本段（必要时按句子边界分块），代码与链接原样保留——避免翻译引擎破坏代码。
 
+健壮性设计（2026-09 修订，修复云端挂起问题）：
+- 启动时对每个后端做健康探测（probe），探测失败的后端本次运行直接跳过；
+- 所有后端探测均失败时立即报错退出（保留上一次已部署的数据，避免静默产出英文站）；
+- 单请求超时从 30s 降到 12s（ARK 30s），重试次数从 3 降到 2，并设置全局 socket 超时；
+- 运行中某后端连续失败会被标记为失效，不再反复慢速重试。
+
 环境变量：
   TRANSLATE_BACKEND : google | mymemory | deepl | ark | auto（默认 auto：优先 google，失败自动降级 mymemory）
   DEEPL_API_KEY     : DeepL API Key（免费 key 形如 xxxx:fx，使用 api-free.deepl.com）
@@ -15,11 +21,14 @@
 import json
 import os
 import re
+import socket
 import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+
+socket.setdefaulttimeout(15)  # 全局兜底：任何 socket 操作不超过 15s
 
 if hasattr(sys.stdout, "reconfigure"):
     try:
@@ -33,6 +42,12 @@ CACHE_PATH = os.path.join(ROOT, "data", "translation_cache.json")
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+
+# Google 单请求可承载较长文本，用大块减少请求数；MyMemory 单次 500 字符上限
+GOOGLE_CHUNK_LIMIT = 2000
+DEFAULT_CHUNK_LIMIT = 450
+TIMEOUT = 12
+ATTEMPTS = 2
 
 
 class TranslationError(Exception):
@@ -57,8 +72,8 @@ def split_segments(text):
     return [(parts[i], i % 2 == 1) for i in range(len(parts))]
 
 
-def _chunk(text, limit=450):
-    """按句子边界把长文本切成 ≤limit 字符的片段（MyMemory 单次上限 500 字符）。"""
+def _chunk(text, limit):
+    """按句子边界把长文本切成 ≤limit 字符的片段。"""
     if len(text) <= limit:
         return [text]
     chunks, cur = [], ""
@@ -139,16 +154,13 @@ _TRAD_SIMP_PAIRS = [
     ("頂", "顶"), ("頻", "频"), ("額", "额"), ("顧", "顾"), ("顯", "显"),
     ("駕", "驾"), ("騙", "骗"), ("髮", "发"), ("鮮", "鲜"), ("齊", "齐"),
     ("齒", "齿"), ("龍", "龙"), ("龜", "龟"), ("歸", "归"), ("筆", "笔"),
-    ("範", "范"), ("嚮", "向"), ("讚", "赞"), ("個", "个"), ("兩", "两"),
+    ("範", "范"), ("嚮", "向"), ("讚", "赞"), ("兩", "两"),
     ("別", "别"), ("動", "动"), ("務", "务"), ("勢", "势"), ("圓", "圆"),
     ("報", "报"), ("牆", "墙"), ("媽", "妈"), ("歲", "岁"), ("帥", "帅"),
     ("徑", "径"), ("戲", "戏"), ("戶", "户"), ("擔", "担"), ("擬", "拟"),
     ("擠", "挤"), ("斷", "断"), ("殼", "壳"), ("減", "减"), ("漢", "汉"),
-    ("澤", "泽"), ("燒", "烧"), ("爭", "争"), ("確", "确"), ("異", "异"),
-    ("築", "筑"), ("純", "纯"), ("習", "习"), ("術", "术"), ("複", "复"),
-    ("計", "计"), ("訓", "训"), ("註", "注"), ("誤", "误"), ("貝", "贝"),
-    ("負", "负"), ("貴", "贵"), ("買", "买"), ("賤", "贱"), ("賜", "赐"),
-    ("賞", "赏"), ("贏", "赢"), ("與", "与"), ("個", "个"),
+    ("澤", "泽"), ("燒", "烧"), ("爭", "争"), ("異", "异"),
+    ("築", "筑"), ("純", "纯"),
 ]
 _TRAD2SIMP = str.maketrans(
     "".join(p[0] for p in _TRAD_SIMP_PAIRS),
@@ -169,13 +181,13 @@ class GoogleTranslator:
         data = urllib.parse.urlencode([
             ("client", "gtx"), ("sl", "en"), ("tl", "zh-CN"), ("dt", "t"), ("q", text),
         ])
-        for attempt in range(3):
+        for attempt in range(ATTEMPTS):
             try:
                 req = urllib.request.Request(
                     self.URL, data=data.encode("utf-8"),
                     headers={"Content-Type": "application/x-www-form-urlencoded",
                              "User-Agent": UA})
-                with urllib.request.urlopen(req, timeout=30) as r:
+                with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
                     raw = r.read().decode("utf-8", "replace")
                 if "Sorry" in raw or raw.lstrip().startswith("<html"):
                     raise TranslationError("google 返回拦截页（反爬）")
@@ -189,12 +201,12 @@ class GoogleTranslator:
             except TranslationError:
                 raise
             except urllib.error.HTTPError as e:
-                if e.code in (429, 403, 503) and attempt < 2:
+                if e.code in (429, 403, 503) and attempt < ATTEMPTS - 1:
                     time.sleep(2 * (attempt + 1))
                     continue
                 raise TranslationError("google http %s" % e.code)
             except (urllib.error.URLError, ValueError, OSError) as e:
-                if attempt < 2:
+                if attempt < ATTEMPTS - 1:
                     time.sleep(1)
                     continue
                 raise TranslationError("google 网络错误: %s" % e)
@@ -211,10 +223,10 @@ class MyMemoryTranslator:
         if email:
             params.append(("de", email))
         url = self.URL + "?" + urllib.parse.urlencode(params)
-        for attempt in range(3):
+        for attempt in range(ATTEMPTS):
             try:
                 req = urllib.request.Request(url, headers={"User-Agent": UA})
-                with urllib.request.urlopen(req, timeout=30) as r:
+                with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
                     parsed = json.loads(r.read().decode("utf-8", "replace"))
                 if parsed.get("responseStatus") != 200:
                     raise TranslationError("mymemory status=%s" % parsed.get("responseStatus"))
@@ -226,12 +238,12 @@ class MyMemoryTranslator:
             except TranslationError:
                 raise
             except urllib.error.HTTPError as e:
-                if e.code in (429, 403, 503) and attempt < 2:
+                if e.code in (429, 403, 503) and attempt < ATTEMPTS - 1:
                     time.sleep(3 * (attempt + 1))
                     continue
                 raise TranslationError("mymemory http %s" % e.code)
             except (urllib.error.URLError, ValueError, OSError) as e:
-                if attempt < 2:
+                if attempt < ATTEMPTS - 1:
                     time.sleep(1)
                     continue
                 raise TranslationError("mymemory 网络错误: %s" % e)
@@ -255,7 +267,7 @@ class DeepLTranslator:
                 "Authorization": "DeepL-Auth-Key " + self.key,
                 "Content-Type": "application/json", "User-Agent": UA})
         try:
-            with urllib.request.urlopen(req, timeout=30) as r:
+            with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
                 parsed = json.loads(r.read().decode("utf-8", "replace"))
             return parsed["translations"][0]["text"]
         except urllib.error.HTTPError as e:
@@ -291,7 +303,7 @@ class ARKTranslator:
                 "Authorization": "Bearer " + self.key,
                 "Content-Type": "application/json", "User-Agent": UA})
         try:
-            with urllib.request.urlopen(req, timeout=60) as r:
+            with urllib.request.urlopen(req, timeout=30) as r:
                 parsed = json.loads(r.read().decode("utf-8", "replace"))
             return parsed["choices"][0]["message"]["content"].strip()
         except urllib.error.HTTPError as e:
@@ -351,8 +363,37 @@ class Translator:
         self.cache = cache or Cache()
         self.backends = build_backends()
         self.stats = {"backend": {}, "chars": 0, "failed": 0}
-        self._preferred_dead = False
+        self._alive = {b.name: True for b in self.backends}
+        self._chunk_limit = DEFAULT_CHUNK_LIMIT
         self._last_backend = ""
+        self._probe()
+
+    def _probe(self):
+        """启动探测：用短文本实测每个后端，失败的后端本次运行直接禁用。"""
+        probe_text = "Hello, Rust community!"
+        for b in self.backends:
+            ok = False
+            try:
+                out = b.translate_one(probe_text)
+                ok = bool(out and out.strip())
+            except TranslationError:
+                ok = False
+            except Exception:
+                ok = False
+            if ok:
+                print("[backend] %s 可用 (探测: %s)" % (b.name, out.strip()[:40]), flush=True)
+                if b.name == "google":
+                    self._chunk_limit = GOOGLE_CHUNK_LIMIT
+            else:
+                self._alive[b.name] = False
+                print("[backend] %s 不可用，本次运行跳过" % b.name, flush=True)
+        alive_names = [n for n, a in self._alive.items() if a]
+        if not alive_names:
+            raise TranslationError(
+                "所有翻译后端均不可用（%s）。请检查网络，或配置 DEEPL_API_KEY / ARK_API_KEY。"
+                % ",".join(self._alive.keys()))
+        print("[backend] 本次运行使用: %s（分块上限 %d 字符）"
+              % (",".join(alive_names), self._chunk_limit), flush=True)
 
     def translate(self, text, cache_key=None):
         """翻译单条文本。cache_key 非空时按 key 缓存（key 通常为消息 id 或标题键）。"""
@@ -369,7 +410,7 @@ class Translator:
             if keep or not seg.strip():
                 outs.append(seg)  # 代码/URL/空段原样保留
             else:
-                translated = [self._translate_seg(c) for c in _chunk(seg)]
+                translated = [self._translate_seg(c) for c in _chunk(seg, self._chunk_limit)]
                 outs.append("".join(translated))
         zh = apply_simp(apply_glossary("".join(outs))).strip()
         if cache_key is not None:
@@ -379,9 +420,8 @@ class Translator:
     def _translate_seg(self, seg):
         if not seg.strip():
             return seg
-        last_err = None
         for b in self.backends:
-            if b.name == self.backends[0].name and self._preferred_dead:
+            if not self._alive.get(b.name):
                 continue
             try:
                 out = b.translate_one(seg)
@@ -389,10 +429,9 @@ class Translator:
                 self.stats["backend"][b.name] = self.stats["backend"].get(b.name, 0) + 1
                 self.stats["chars"] += len(seg)
                 return out
-            except TranslationError as e:
-                last_err = e
-                if b.name == self.backends[0].name:
-                    self._preferred_dead = True  # 本会话内不再尝试首选后端
-                time.sleep(0.4)
+            except TranslationError:
+                self._alive[b.name] = False  # 运行中失效：本次运行不再尝试
+                print("[warn] 后端 %s 运行中失效，改用其他后端" % b.name, flush=True)
+                time.sleep(0.2)
         self.stats["failed"] += 1
         return seg  # 全部失败：保留原文，下轮再试
