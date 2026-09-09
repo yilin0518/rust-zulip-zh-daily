@@ -49,6 +49,16 @@ DEFAULT_CHUNK_LIMIT = 450
 TIMEOUT = 12
 ATTEMPTS = 2
 
+# 请求节流：成功调用后的等待秒数（实测 Google 在 GitHub 运行器上 0.5s/次 稳定 60/60）
+PACING = {"google": 0.5, "mymemory": 0.25, "deepl": 0.15, "ark": 0.1}
+# 后端连续失败次数达到该值后，本次运行禁用（防止持久性故障拖慢整体）
+DEAD_AFTER_CONSEC = 5
+# 连续失败后的冷却（秒）：15s, 30s, 45s … 指数增长
+COOLDOWN_BASE = 15
+
+# MyMemory 匿名配额仅 5000 字符/天，带 de 参数（任意标识邮箱）提升到 5 万字符/天
+MYMEMORY_DEFAULT_EMAIL = "rust-zulip-daily@users.noreply.github.com"
+
 
 class TranslationError(Exception):
     pass
@@ -219,9 +229,8 @@ class MyMemoryTranslator:
 
     def translate_one(self, text):
         params = [("q", text), ("langpair", "en|zh-CN")]
-        email = os.environ.get("MYMEMORY_EMAIL", "").strip()
-        if email:
-            params.append(("de", email))
+        email = os.environ.get("MYMEMORY_EMAIL", "").strip() or MYMEMORY_DEFAULT_EMAIL
+        params.append(("de", email))
         url = self.URL + "?" + urllib.parse.urlencode(params)
         for attempt in range(ATTEMPTS):
             try:
@@ -363,7 +372,9 @@ class Translator:
         self.cache = cache or Cache()
         self.backends = build_backends()
         self.stats = {"backend": {}, "chars": 0, "failed": 0}
-        self._alive = {b.name: True for b in self.backends}
+        self._dead = {b.name: False for b in self.backends}
+        self._consec = {b.name: 0 for b in self.backends}
+        self._cooldown_until = {b.name: 0.0 for b in self.backends}
         self._chunk_limit = DEFAULT_CHUNK_LIMIT
         self._last_backend = ""
         self._probe()
@@ -385,15 +396,16 @@ class Translator:
                 if b.name == "google":
                     self._chunk_limit = GOOGLE_CHUNK_LIMIT
             else:
-                self._alive[b.name] = False
+                self._dead[b.name] = True
                 print("[backend] %s 不可用，本次运行跳过" % b.name, flush=True)
-        alive_names = [n for n, a in self._alive.items() if a]
+        alive_names = [n for n, a in self._dead.items() if not a]
         if not alive_names:
             raise TranslationError(
                 "所有翻译后端均不可用（%s）。请检查网络，或配置 DEEPL_API_KEY / ARK_API_KEY。"
-                % ",".join(self._alive.keys()))
-        print("[backend] 本次运行使用: %s（分块上限 %d 字符）"
-              % (",".join(alive_names), self._chunk_limit), flush=True)
+                % ",".join(self._dead.keys()))
+        print("[backend] 本次运行使用: %s（分块上限 %d 字符，节流 %ss）"
+              % (",".join(alive_names), self._chunk_limit, PACING.get(alive_names[0], 0.2)),
+              flush=True)
 
     def translate(self, text, cache_key=None):
         """翻译单条文本。cache_key 非空时按 key 缓存（key 通常为消息 id 或标题键）。"""
@@ -420,18 +432,29 @@ class Translator:
     def _translate_seg(self, seg):
         if not seg.strip():
             return seg
+        now = time.time()
         for b in self.backends:
-            if not self._alive.get(b.name):
+            if self._dead.get(b.name) or now < self._cooldown_until[b.name]:
                 continue
             try:
                 out = b.translate_one(seg)
+                self._consec[b.name] = 0
+                self._cooldown_until[b.name] = 0.0
                 self._last_backend = b.name
                 self.stats["backend"][b.name] = self.stats["backend"].get(b.name, 0) + 1
                 self.stats["chars"] += len(seg)
+                pace = PACING.get(b.name, 0.2)
+                if pace > 0:
+                    time.sleep(pace)  # 节流：避免突发请求触发限流
                 return out
             except TranslationError:
-                self._alive[b.name] = False  # 运行中失效：本次运行不再尝试
-                print("[warn] 后端 %s 运行中失效，改用其他后端" % b.name, flush=True)
+                self._consec[b.name] += 1
+                if self._consec[b.name] >= DEAD_AFTER_CONSEC:
+                    self._dead[b.name] = True
+                    print("[warn] 后端 %s 连续 %d 次失败，本次运行禁用"
+                          % (b.name, DEAD_AFTER_CONSEC), flush=True)
+                else:
+                    self._cooldown_until[b.name] = now + COOLDOWN_BASE * self._consec[b.name]
                 time.sleep(0.2)
         self.stats["failed"] += 1
         return seg  # 全部失败：保留原文，下轮再试
