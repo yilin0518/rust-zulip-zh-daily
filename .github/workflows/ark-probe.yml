@@ -1,0 +1,43 @@
+name: ark-probe
+on:
+  workflow_dispatch: {}
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: 探测 ARK 可达性
+        run: |
+          python3 - <<'EOF'
+          import socket, json, urllib.request, urllib.error, time
+          host = "ark.cn-beijing.volces.com"
+          try:
+              s = socket.create_connection((host, 443), timeout=20)
+              print("TCP/443 连接: OK", s.getpeername())
+              s.close()
+          except Exception as e:
+              print("TCP/443 连接: FAIL", e)
+          key = "${{ secrets.ARK_API_KEY }}"
+          model = "${{ secrets.ARK_MODEL }}"
+          print("key 前缀:", key[:8], "model:", model)
+          for attempt in range(2):
+              payload = json.dumps({
+                  "model": model,
+                  "messages": [{"role": "user", "content": "Translate to Chinese: The borrow checker prevents data races."}]
+              }).encode()
+              req = urllib.request.Request("https://%s/api/v3/chat/completions" % host, data=payload, headers={
+                  "Authorization": "Bearer " + key, "Content-Type": "application/json"})
+              t0 = time.time()
+              try:
+                  with urllib.request.urlopen(req, timeout=90) as r:
+                      p = json.loads(r.read().decode())
+                  print("ARK API: OK (%.1fs)" % (time.time()-t0), p["choices"][0]["message"]["content"][:40])
+                  break
+              except urllib.error.HTTPError as e:
+                  print("ARK API: HTTP", e.code, "%.1fs" % (time.time()-t0), e.read().decode('utf-8','replace')[:120])
+              except Exception as e:
+                  print("ARK API: ERR %.1fs" % (time.time()-t0), type(e).__name__, str(e)[:200])
+          EOF
