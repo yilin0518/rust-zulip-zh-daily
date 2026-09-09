@@ -45,6 +45,7 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 
 # Google 单请求可承载较长文本，用大块减少请求数；MyMemory 单次 500 字符上限
 GOOGLE_CHUNK_LIMIT = 2000
+ARK_CHUNK_LIMIT = 4000  # ARK 上下文窗口大，用更大块减少调用次数
 DEFAULT_CHUNK_LIMIT = 450
 TIMEOUT = 12
 ATTEMPTS = 2
@@ -403,8 +404,10 @@ class Translator:
                 ok = False
             if ok:
                 print("[backend] %s 可用 (探测: %s)" % (b.name, out.strip()[:40]), flush=True)
-                if b.name in ("google", "ark"):
+                if b.name == "google":
                     self._chunk_limit = GOOGLE_CHUNK_LIMIT
+                elif b.name == "ark":
+                    self._chunk_limit = ARK_CHUNK_LIMIT
             else:
                 self._dead[b.name] = True
                 print("[backend] %s 不可用，本次运行跳过" % b.name, flush=True)

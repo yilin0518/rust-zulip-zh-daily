@@ -32,6 +32,7 @@ jobs:
           TOPICS_PER_STREAM: ${{ vars.TOPICS_PER_STREAM }}
           STREAMS: ${{ vars.STREAMS }}
           TRANSLATE_BACKEND: ${{ vars.TRANSLATE_BACKEND }}
+          TRANSLATE_BUDGET_MIN: '240'
           DEEPL_API_KEY: ${{ secrets.DEEPL_API_KEY }}
           ARK_API_KEY: ${{ secrets.ARK_API_KEY }}
           ARK_MODEL: ${{ secrets.ARK_MODEL }}
