@@ -3,7 +3,17 @@ name: daily-update
 on:
   schedule:
     - cron: '0 6 * * *'
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      translation_backend:
+        description: '本次运行用于新增消息的翻译后端'
+        required: true
+        default: 'mymemory'
+        type: choice
+        options:
+          - mymemory
+          - openai
+          - mymemory+openai
 
 permissions:
   contents: write
@@ -31,9 +41,10 @@ jobs:
           ZULIP_API_KEY: ${{ secrets.ZULIP_API_KEY }}
           TOPICS_PER_STREAM: ${{ vars.TOPICS_PER_STREAM }}
           STREAMS: ${{ vars.STREAMS }}
-          TRANSLATE_BACKEND: 'openai'
-          STREAM_TRANSLATE_BACKENDS: ${{ vars.STREAM_TRANSLATE_BACKENDS || 'general=deepl,t-compiler=deepl,t-libs=baidu,t-opsem=baidu' }}
+          TRANSLATE_BACKEND: ${{ inputs.translation_backend || 'mymemory' }}
+          STREAM_TRANSLATE_BACKENDS: ${{ inputs.translation_backend == 'openai' && 'general=openai,t-compiler=openai,t-libs=openai,t-opsem=openai' || inputs.translation_backend == 'mymemory+openai' && 'general=mymemory+openai,t-compiler=mymemory+openai,t-libs=mymemory+openai,t-opsem=mymemory+openai' || 'general=mymemory,t-compiler=mymemory,t-libs=mymemory,t-opsem=mymemory' }}
           TRANSLATE_BUDGET_MIN: '240'
+          MYMEMORY_EMAIL: ${{ vars.MYMEMORY_EMAIL }}
           DEEPL_API_KEY: ${{ secrets.DEEPL_API_KEY }}
           BAIDU_APP_ID: ${{ secrets.BAIDU_APP_ID }}
           BAIDU_SECRET_KEY: ${{ secrets.BAIDU_SECRET_KEY }}

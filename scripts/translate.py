@@ -12,7 +12,7 @@
 - 运行中某后端连续失败会被标记为失效，不再反复慢速重试。
 
 环境变量：
-  TRANSLATE_BACKEND : openai | google | mymemory | deepl | baidu | auto
+  TRANSLATE_BACKEND : 单个后端，或用 + 连接的降级链（如 deepl+baidu）
   OPENAI_API_KEY    : OpenAI 或第三方 OpenAI 兼容服务的 API Key
   OPENAI_BASE_URL   : API 根地址，默认 https://api.openai.com/v1
   OPENAI_MODEL      : 模型名称，由所使用的服务提供
@@ -63,8 +63,7 @@ DEAD_AFTER_CONSEC = 5
 # 连续失败后的冷却（秒）：15s, 30s, 45s … 指数增长
 COOLDOWN_BASE = 15
 
-# MyMemory 匿名配额仅 5000 字符/天，带 de 参数（任意标识邮箱）提升到 5 万字符/天
-MYMEMORY_DEFAULT_EMAIL = "rust-zulip-daily@users.noreply.github.com"
+# MyMemory 可选 de 参数应填写有效邮箱，用于识别调用方及适用配额。
 
 
 class TranslationError(Exception):
@@ -236,8 +235,9 @@ class MyMemoryTranslator:
 
     def translate_one(self, text):
         params = [("q", text), ("langpair", "en|zh-CN")]
-        email = os.environ.get("MYMEMORY_EMAIL", "").strip() or MYMEMORY_DEFAULT_EMAIL
-        params.append(("de", email))
+        email = os.environ.get("MYMEMORY_EMAIL", "").strip()
+        if email:
+            params.append(("de", email))
         url = self.URL + "?" + urllib.parse.urlencode(params)
         for attempt in range(ATTEMPTS):
             try:
@@ -399,25 +399,34 @@ class OpenAITranslator:
 
 
 def build_backends(name=None):
-    """按优先级返回后端列表。TRANSLATE_BACKEND 显式指定时只用该后端（无降级链）；
-    auto（默认）时：配置了 OpenAI 则优先使用，否则使用 google + mymemory。"""
+    """按优先级返回后端列表；使用 + 可声明降级链，如 deepl+baidu。"""
     name = (name or os.environ.get("TRANSLATE_BACKEND") or "auto").strip().lower()
-    if name == "deepl":
-        return [DeepLTranslator()]
-    if name == "openai":
-        return [OpenAITranslator()]
-    if name == "baidu":
-        return [BaiduTranslator()]
-    if name == "mymemory":
-        return [MyMemoryTranslator()]
-    if name == "google":
-        return [GoogleTranslator()]
-    backends = [GoogleTranslator(), MyMemoryTranslator()]
-    try:
-        openai = OpenAITranslator()
-        backends = [openai] + backends
-    except TranslationError:
-        pass
+    factories = {
+        "deepl": DeepLTranslator,
+        "openai": OpenAITranslator,
+        "baidu": BaiduTranslator,
+        "mymemory": MyMemoryTranslator,
+        "google": GoogleTranslator,
+    }
+    if name == "auto":
+        backends = [GoogleTranslator(), MyMemoryTranslator()]
+        try:
+            backends.insert(0, OpenAITranslator())
+        except TranslationError:
+            pass
+        return backends
+    names = [part.strip() for part in name.split("+") if part.strip()]
+    if not names or any(part not in factories for part in names):
+        raise TranslationError("无效翻译后端或降级链: %s" % name)
+    backends = []
+    errors = []
+    for part in names:
+        try:
+            backends.append(factories[part]())
+        except TranslationError as e:
+            errors.append("%s: %s" % (part, e))
+    if not backends:
+        raise TranslationError("翻译后端初始化失败（%s）" % "; ".join(errors))
     return backends
 
 
@@ -482,14 +491,6 @@ class Translator:
                 ok = False
             if ok:
                 print("[backend] %s 可用 (探测: %s)" % (b.name, out.strip()[:40]), flush=True)
-                if b.name == "google":
-                    self._chunk_limit = GOOGLE_CHUNK_LIMIT
-                elif b.name == "openai":
-                    self._chunk_limit = OPENAI_CHUNK_LIMIT
-                elif b.name == "deepl":
-                    self._chunk_limit = DEEPL_CHUNK_LIMIT
-                elif b.name == "baidu":
-                    self._chunk_limit = BAIDU_CHUNK_LIMIT
             else:
                 self._dead[b.name] = True
                 print("[backend] %s 不可用，本次运行跳过" % b.name, flush=True)
@@ -498,6 +499,16 @@ class Translator:
             raise TranslationError(
                 "所有翻译后端均不可用（%s）。请检查网络和所选后端的凭据。"
                 % ",".join(self._dead.keys()))
+        chunk_limits = {
+            "google": GOOGLE_CHUNK_LIMIT,
+            "openai": OPENAI_CHUNK_LIMIT,
+            "deepl": DEEPL_CHUNK_LIMIT,
+            "baidu": BAIDU_CHUNK_LIMIT,
+        }
+        self._chunk_limit = min(
+            (chunk_limits.get(name, DEFAULT_CHUNK_LIMIT) for name in alive_names),
+            default=DEFAULT_CHUNK_LIMIT,
+        )
         print("[backend] 本次运行使用: %s（分块上限 %d 字符，节流 %ss）"
               % (",".join(alive_names), self._chunk_limit, PACING.get(alive_names[0], 0.2)),
               flush=True)
@@ -582,8 +593,8 @@ class Translator:
             todo.append((key, text))
         if not todo:
             return result
-        ai = next((b for b in self.backends
-                   if b.name == "openai" and not self._dead.get(b.name)), None)
+        alive = [b for b in self.backends if not self._dead.get(b.name)]
+        ai = alive[0] if alive and alive[0].name == "openai" else None
         if ai is None:
             for key, text in todo:
                 result[key] = self.translate(text, cache_key=key)

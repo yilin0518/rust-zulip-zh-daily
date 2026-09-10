@@ -13,8 +13,9 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "scripts"))
 
 from summarize import Summarizer, SummaryCache  # noqa: E402
-from pipeline import parse_translation_routes  # noqa: E402
-from translate import BaiduTranslator, OpenAITranslator  # noqa: E402
+from pipeline import parse_translation_routes, topic_zulip_url, valid_backend_spec  # noqa: E402
+from translate import (BaiduTranslator, Cache, OpenAITranslator,  # noqa: E402
+                       TranslationError, Translator)
 
 
 class FakeResponse:
@@ -60,14 +61,57 @@ class OpenAICompatibleTests(unittest.TestCase):
 
     def test_translation_routes_support_openai_override(self):
         defaults = parse_translation_routes("")
-        self.assertEqual(defaults["general"], "deepl")
-        self.assertEqual(defaults["t-compiler"], "deepl")
-        self.assertEqual(defaults["t-libs"], "baidu")
-        self.assertEqual(defaults["t-opsem"], "baidu")
+        self.assertEqual(defaults["general"], "mymemory")
+        self.assertEqual(defaults["t-compiler"], "mymemory")
+        self.assertEqual(defaults["t-libs"], "mymemory")
+        self.assertEqual(defaults["t-opsem"], "mymemory")
 
         routes = parse_translation_routes("t-libs=openai,t-opsem=deepl")
         self.assertEqual(routes["t-libs"], "openai")
         self.assertEqual(routes["t-opsem"], "deepl")
+        self.assertTrue(valid_backend_spec("deepl+baidu"))
+        self.assertFalse(valid_backend_spec("auto+baidu"))
+
+    def test_topic_zulip_url_uses_newest_message(self):
+        self.assertEqual(
+            topic_zulip_url([{"id": 12}, {"id": 37}, {"id": 21}]),
+            "https://rust-lang.zulipchat.com/#narrow/with/37",
+        )
+        self.assertEqual(topic_zulip_url([]), "")
+
+    @patch.dict(os.environ, {
+        "DEEPL_API_KEY": "test-deepl-key:fx",
+        "BAIDU_APP_ID": "test-app-id",
+        "BAIDU_SECRET_KEY": "test-secret",
+    }, clear=False)
+    @patch.object(Translator, "_probe")
+    @patch("translate.time.sleep")
+    def test_deepl_failure_falls_back_to_baidu(self, _sleep, _probe):
+        with tempfile.TemporaryDirectory() as directory:
+            translator = Translator(
+                Cache(os.path.join(directory, "cache.json")),
+                backend="deepl+baidu",
+            )
+            self.assertEqual([backend.name for backend in translator.backends],
+                             ["deepl", "baidu"])
+            translator.backends[0].translate_one = lambda _text: (
+                _ for _ in ()).throw(TranslationError("quota exceeded"))
+            translator.backends[1].translate_one = lambda _text: "百度译文"
+            self.assertEqual(translator._translate_seg("source"), "百度译文")
+            self.assertEqual(translator.stats["backend"], {"baidu": 1})
+
+    @patch.dict(os.environ, {
+        "BAIDU_APP_ID": "test-app-id",
+        "BAIDU_SECRET_KEY": "test-secret",
+    }, clear=True)
+    @patch.object(Translator, "_probe")
+    def test_chain_skips_unconfigured_deepl(self, _probe):
+        with tempfile.TemporaryDirectory() as directory:
+            translator = Translator(
+                Cache(os.path.join(directory, "cache.json")),
+                backend="deepl+baidu",
+            )
+            self.assertEqual([backend.name for backend in translator.backends], ["baidu"])
 
     @patch.dict(os.environ, {
         "OPENAI_API_KEY": "test-key",

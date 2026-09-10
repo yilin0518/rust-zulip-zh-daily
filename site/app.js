@@ -202,6 +202,15 @@ function renderMessages() {
   $("#topicMeta").textContent =
     `${t.count} 条消息 · 最后活跃 ${fmtFull(t.last)} · 最早 ${fmtFull(t.first)}`;
 
+  const sourceLink = $("#topicSourceLink");
+  if (t.zulip_url) {
+    sourceLink.href = t.zulip_url;
+    sourceLink.hidden = false;
+  } else {
+    sourceLink.removeAttribute("href");
+    sourceLink.hidden = true;
+  }
+
   const summaryBox = $("#topicSummary");
   if (t.summary) {
     $("#summaryContent").innerHTML = md(t.summary);

@@ -47,12 +47,28 @@ DEFAULT_STREAMS = [
 ]
 
 DEFAULT_TRANSLATION_ROUTES = {
-    "general": "deepl",
-    "t-compiler": "deepl",
-    "t-libs": "baidu",
-    "t-opsem": "baidu",
+    "general": "mymemory",
+    "t-compiler": "mymemory",
+    "t-libs": "mymemory",
+    "t-opsem": "mymemory",
 }
 SUPPORTED_TRANSLATION_BACKENDS = {"openai", "deepl", "baidu", "google", "mymemory", "auto"}
+
+
+def topic_zulip_url(messages):
+    """Return a stable Zulip narrow URL anchored at the newest message."""
+    message_ids = [message.get("id") for message in messages
+                   if message.get("id") is not None]
+    if not message_ids:
+        return ""
+    return "https://rust-lang.zulipchat.com/#narrow/with/%s" % max(message_ids)
+
+
+def valid_backend_spec(spec):
+    parts = [part.strip() for part in spec.split("+") if part.strip()]
+    return (bool(parts)
+            and all(part in SUPPORTED_TRANSLATION_BACKENDS for part in parts)
+            and (len(parts) == 1 or "auto" not in parts))
 
 
 def parse_translation_routes(raw):
@@ -67,7 +83,7 @@ def parse_translation_routes(raw):
         except ValueError:
             raise ValueError("翻译路由格式错误: %s" % entry)
         backend = backend.lower()
-        if not stream or backend not in SUPPORTED_TRANSLATION_BACKENDS:
+        if not stream or not valid_backend_spec(backend):
             raise ValueError("无效翻译路由: %s" % entry)
         routes[stream] = backend
     return routes
@@ -92,8 +108,8 @@ def main():
         streams_cfg = [{"key": s.strip(), "display": s.strip().title()}
                        for s in os.environ["STREAMS"].split(",") if s.strip()]
 
-    default_backend = (os.environ.get("TRANSLATE_BACKEND") or "openai").strip().lower()
-    if default_backend not in SUPPORTED_TRANSLATION_BACKENDS:
+    default_backend = (os.environ.get("TRANSLATE_BACKEND") or "mymemory").strip().lower()
+    if not valid_backend_spec(default_backend):
         sys.exit("错误：无效翻译后端: %s" % default_backend)
     try:
         translation_routes = parse_translation_routes(
@@ -146,7 +162,8 @@ def main():
             topic_jobs = []
             for ti, topic in enumerate(topics, 1):
                 msgs = client.get_topic_messages(sid, topic["name"])
-                job = {"topic": topic, "messages": msgs}
+                zulip_url = topic_zulip_url(msgs)
+                job = {"topic": topic, "messages": msgs, "zulip_url": zulip_url}
                 future = executor.submit(summarizer.summarize, name, topic["name"], msgs)
                 job["summary_future"] = future
                 summary_futures[future] = (name, topic["name"], job)
@@ -191,6 +208,7 @@ def main():
                     "name": topic["name"],
                     "name_zh": title_zh,
                     "summary": "",
+                    "zulip_url": job["zulip_url"],
                     "count": len(out_msgs),
                     "first": topic["first"],
                     "last": topic["last"],
