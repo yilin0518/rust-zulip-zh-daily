@@ -12,13 +12,16 @@
 - 运行中某后端连续失败会被标记为失效，不再反复慢速重试。
 
 环境变量：
-  TRANSLATE_BACKEND : openai | google | mymemory | deepl | auto
+  TRANSLATE_BACKEND : openai | google | mymemory | deepl | baidu | auto
   OPENAI_API_KEY    : OpenAI 或第三方 OpenAI 兼容服务的 API Key
   OPENAI_BASE_URL   : API 根地址，默认 https://api.openai.com/v1
   OPENAI_MODEL      : 模型名称，由所使用的服务提供
   DEEPL_API_KEY     : DeepL API Key（免费 key 形如 xxxx:fx，使用 api-free.deepl.com）
+  BAIDU_APP_ID      : 百度翻译开放平台 APPID
+  BAIDU_SECRET_KEY  : 百度翻译开放平台密钥
   MYMEMORY_EMAIL    : MyMemory 邮箱参数（匿名每天 5000 字符；带邮箱每天 5 万字符）
 """
+import hashlib
 import json
 import os
 import re
@@ -47,12 +50,14 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 # Google 单请求可承载较长文本，用大块减少请求数；MyMemory 单次 500 字符上限
 GOOGLE_CHUNK_LIMIT = 2000
 OPENAI_CHUNK_LIMIT = 4000
+DEEPL_CHUNK_LIMIT = 4000
+BAIDU_CHUNK_LIMIT = 1800
 DEFAULT_CHUNK_LIMIT = 450
 TIMEOUT = 12
 ATTEMPTS = 2
 
 # 请求节流：成功调用后的等待秒数（实测 Google 在 GitHub 运行器上 0.5s/次 稳定 60/60）
-PACING = {"google": 0.5, "mymemory": 0.25, "deepl": 0.15, "openai": 0.1}
+PACING = {"google": 0.5, "mymemory": 0.25, "deepl": 0.15, "baidu": 0.12, "openai": 0.1}
 # 后端连续失败次数达到该值后，本次运行禁用（防止持久性故障拖慢整体）
 DEAD_AFTER_CONSEC = 5
 # 连续失败后的冷却（秒）：15s, 30s, 45s … 指数增长
@@ -287,6 +292,62 @@ class DeepLTranslator:
             raise TranslationError("deepl 错误: %s" % e)
 
 
+class BaiduTranslator:
+    """百度通用文本翻译 API（APPID + 密钥 MD5 签名）。"""
+    name = "baidu"
+    URL = "https://fanyi-api.baidu.com/api/trans/vip/translate"
+
+    def __init__(self):
+        self.app_id = os.environ.get("BAIDU_APP_ID", "").strip()
+        self.secret_key = os.environ.get("BAIDU_SECRET_KEY", "").strip()
+        if not self.app_id or not self.secret_key:
+            raise TranslationError("缺少 BAIDU_APP_ID / BAIDU_SECRET_KEY")
+
+    def translate_one(self, text):
+        for attempt in range(ATTEMPTS):
+            salt = str(time.time_ns())
+            sign_text = self.app_id + text + salt + self.secret_key
+            sign = hashlib.md5(sign_text.encode("utf-8")).hexdigest()
+            body = urllib.parse.urlencode({
+                "q": text,
+                "from": "en",
+                "to": "zh",
+                "appid": self.app_id,
+                "salt": salt,
+                "sign": sign,
+            }).encode("utf-8")
+            try:
+                req = urllib.request.Request(
+                    self.URL, data=body, headers={
+                        "Content-Type": "application/x-www-form-urlencoded",
+                        "User-Agent": UA,
+                    })
+                with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
+                    parsed = json.loads(r.read().decode("utf-8", "replace"))
+                if "error_code" in parsed:
+                    code = str(parsed.get("error_code"))
+                    if code in ("52001", "52002", "54003") and attempt < ATTEMPTS - 1:
+                        time.sleep(attempt + 1)
+                        continue
+                    raise TranslationError("baidu %s: %s" % (code, parsed.get("error_msg", "未知错误")))
+                results = parsed.get("trans_result") or []
+                translated = "\n".join(item.get("dst", "") for item in results).strip()
+                if not translated:
+                    raise TranslationError("baidu 返回空结果")
+                return translated
+            except urllib.error.HTTPError as e:
+                if e.code in (429, 500, 502, 503) and attempt < ATTEMPTS - 1:
+                    time.sleep(attempt + 1)
+                    continue
+                raise TranslationError("baidu http %s: %s" % (e.code, e.read()[:200]))
+            except (urllib.error.URLError, ValueError, KeyError, OSError) as e:
+                if attempt < ATTEMPTS - 1:
+                    time.sleep(attempt + 1)
+                    continue
+                raise TranslationError("baidu 错误: %s" % e)
+        raise TranslationError("baidu 失败")
+
+
 class OpenAITranslator:
     """OpenAI Chat Completions 兼容客户端，可连接官方或第三方服务。"""
     name = "openai"
@@ -337,14 +398,16 @@ class OpenAITranslator:
         ])
 
 
-def build_backends():
+def build_backends(name=None):
     """按优先级返回后端列表。TRANSLATE_BACKEND 显式指定时只用该后端（无降级链）；
     auto（默认）时：配置了 OpenAI 则优先使用，否则使用 google + mymemory。"""
-    name = (os.environ.get("TRANSLATE_BACKEND") or "auto").strip().lower()
+    name = (name or os.environ.get("TRANSLATE_BACKEND") or "auto").strip().lower()
     if name == "deepl":
         return [DeepLTranslator()]
     if name == "openai":
         return [OpenAITranslator()]
+    if name == "baidu":
+        return [BaiduTranslator()]
     if name == "mymemory":
         return [MyMemoryTranslator()]
     if name == "google":
@@ -394,9 +457,9 @@ class Cache:
 
 # ---------------- 统一入口 ----------------
 class Translator:
-    def __init__(self, cache=None):
+    def __init__(self, cache=None, backend=None):
         self.cache = cache or Cache()
-        self.backends = build_backends()
+        self.backends = build_backends(backend)
         self.stats = {"backend": {}, "chars": 0, "failed": 0}
         self._dead = {b.name: False for b in self.backends}
         self._consec = {b.name: 0 for b in self.backends}
@@ -423,13 +486,17 @@ class Translator:
                     self._chunk_limit = GOOGLE_CHUNK_LIMIT
                 elif b.name == "openai":
                     self._chunk_limit = OPENAI_CHUNK_LIMIT
+                elif b.name == "deepl":
+                    self._chunk_limit = DEEPL_CHUNK_LIMIT
+                elif b.name == "baidu":
+                    self._chunk_limit = BAIDU_CHUNK_LIMIT
             else:
                 self._dead[b.name] = True
                 print("[backend] %s 不可用，本次运行跳过" % b.name, flush=True)
         alive_names = [n for n, a in self._dead.items() if not a]
         if not alive_names:
             raise TranslationError(
-                "所有翻译后端均不可用（%s）。请检查网络，或配置 OPENAI_API_KEY / OPENAI_MODEL。"
+                "所有翻译后端均不可用（%s）。请检查网络和所选后端的凭据。"
                 % ",".join(self._dead.keys()))
         print("[backend] 本次运行使用: %s（分块上限 %d 字符，节流 %ss）"
               % (",".join(alive_names), self._chunk_limit, PACING.get(alive_names[0], 0.2)),

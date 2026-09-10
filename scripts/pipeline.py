@@ -11,6 +11,7 @@
     OPENAI_API_KEY / OPENAI_MODEL 必填，翻译与总结共用
     OPENAI_BASE_URL               可选，第三方 OpenAI 兼容服务地址
     AI_CONCURRENCY                帖子总结并发数，默认 4
+    STREAM_TRANSLATE_BACKENDS     按频道选择翻译后端，格式 stream=backend,...
 输出：
     site/data/<频道>.json         站点数据（双语）
     site/data/meta.json           元信息
@@ -45,6 +46,32 @@ DEFAULT_STREAMS = [
     {"key": "t-opsem", "display": "T-opsem"},
 ]
 
+DEFAULT_TRANSLATION_ROUTES = {
+    "general": "deepl",
+    "t-compiler": "deepl",
+    "t-libs": "baidu",
+    "t-opsem": "baidu",
+}
+SUPPORTED_TRANSLATION_BACKENDS = {"openai", "deepl", "baidu", "google", "mymemory", "auto"}
+
+
+def parse_translation_routes(raw):
+    routes = dict(DEFAULT_TRANSLATION_ROUTES)
+    if not raw:
+        return routes
+    for entry in raw.split(","):
+        if not entry.strip():
+            continue
+        try:
+            stream, backend = (part.strip() for part in entry.split("=", 1))
+        except ValueError:
+            raise ValueError("翻译路由格式错误: %s" % entry)
+        backend = backend.lower()
+        if not stream or backend not in SUPPORTED_TRANSLATION_BACKENDS:
+            raise ValueError("无效翻译路由: %s" % entry)
+        routes[stream] = backend
+    return routes
+
 
 def main():
     email = os.environ.get("ZULIP_EMAIL", "").strip()
@@ -65,10 +92,26 @@ def main():
         streams_cfg = [{"key": s.strip(), "display": s.strip().title()}
                        for s in os.environ["STREAMS"].split(",") if s.strip()]
 
+    default_backend = (os.environ.get("TRANSLATE_BACKEND") or "openai").strip().lower()
+    if default_backend not in SUPPORTED_TRANSLATION_BACKENDS:
+        sys.exit("错误：无效翻译后端: %s" % default_backend)
+    try:
+        translation_routes = parse_translation_routes(
+            os.environ.get("STREAM_TRANSLATE_BACKENDS", "").strip())
+        stream_backends = {
+            cfg["key"]: translation_routes.get(cfg["key"], default_backend)
+            for cfg in streams_cfg
+        }
+    except ValueError as e:
+        sys.exit("错误：%s" % e)
+
     client = ZulipClient(email, api_key)
     cache = Cache()
     try:
-        tr = Translator(cache)
+        translators = {
+            backend: Translator(cache, backend=backend)
+            for backend in sorted(set(stream_backends.values()))
+        }
         summarizer = Summarizer()
     except Exception as e:
         sys.exit("错误：翻译后端初始化失败——%s" % e)
@@ -116,6 +159,7 @@ def main():
         stream_outputs = []
         for stream_job in stream_jobs:
             name = stream_job["name"]
+            tr = translators[stream_backends[name]]
             out_topics = []
             for ti, job in enumerate(stream_job["topics"], 1):
                 topic = job["topic"]
@@ -194,8 +238,11 @@ def main():
     summarizer.cache.save()
 
     print("\n完成：%d 个频道, %d 个话题, %d 条消息" % (len(streams_cfg), total_topics, total_msgs), flush=True)
-    print("翻译后端: %s  翻译字符数: %d  失败保留原文: %d" % (
-        tr.stats["backend"], tr.stats["chars"], tr.stats["failed"]), flush=True)
+    for backend, translator in translators.items():
+        routed_streams = [name for name, selected in stream_backends.items() if selected == backend]
+        print("翻译后端 %s (%s): %s  翻译字符数: %d  失败保留原文: %d" % (
+            backend, ",".join(routed_streams), translator.stats["backend"],
+            translator.stats["chars"], translator.stats["failed"]), flush=True)
     print("AI 总结: 新生成 %d，失败 %d" % (summarizer.generated, summarizer.failed), flush=True)
     if budget_exhausted():
         print("[warn] 翻译时间预算（%s 分钟）已耗尽，部分消息保留英文原文" % budget_min, flush=True)

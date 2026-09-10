@@ -12,7 +12,8 @@
 - 右侧对话：每条消息中英文对照，可一键切换「双语 / 中文 / English」
 - 帖子总结：将话题内全部英文聊天原文发送给 AI，生成主要内容、结论及待解决问题的中文摘要
 - 翻译缓存：已翻译的消息不会重复翻译，增量更新极快
-- OpenAI 兼容接口：可使用 OpenAI 官方 API 或支持 OpenAI 协议的第三方服务
+- 按频道路由翻译：`general`、`t-compiler` 使用 DeepL，`t-libs`、`t-opsem` 使用百度
+- OpenAI 兼容翻译仍作为可选后端；帖子总结使用 OpenAI 兼容接口
 
 ## 目录结构
 
@@ -49,6 +50,9 @@ rust-lang Zulip 的 API 需要登录凭据（即使频道是公开的）：
 | `ZULIP_EMAIL` | 是 | Zulip bot 邮箱 |
 | `ZULIP_API_KEY` | 是 | Zulip bot API Key |
 | `OPENAI_API_KEY` | 是 | OpenAI 官方或第三方兼容服务的 API Key |
+| `DEEPL_API_KEY` | 是 | DeepL API Free/Pro 的认证 Key |
+| `BAIDU_APP_ID` | 是 | 百度翻译开放平台 APPID |
+| `BAIDU_SECRET_KEY` | 是 | 百度翻译开放平台密钥 |
 
 可选 Variables（仓库 Settings → Variables）：
 
@@ -59,6 +63,7 @@ rust-lang Zulip 的 API 需要登录凭据（即使频道是公开的）：
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | 第三方服务请填写其兼容 API 根地址 |
 | `OPENAI_MODEL` | 无 | 服务商提供的模型名称，必须配置 |
 | `AI_CONCURRENCY` | `4` | 同时生成帖子总结的最大请求数；遇到限流可调低 |
+| `STREAM_TRANSLATE_BACKENDS` | 见下文 | `频道=后端` 路由，逗号分隔 |
 
 ### 3. 启用 GitHub Pages
 
@@ -79,6 +84,10 @@ python --version
 $env:ZULIP_EMAIL="xxx-bot@rust-lang.zulipchat.com"
 $env:ZULIP_API_KEY="你的APIKey"
 $env:TRANSLATE_BACKEND="openai"
+$env:STREAM_TRANSLATE_BACKENDS="general=deepl,t-compiler=deepl,t-libs=baidu,t-opsem=baidu"
+$env:DEEPL_API_KEY="你的 DeepL Key"
+$env:BAIDU_APP_ID="你的百度 APPID"
+$env:BAIDU_SECRET_KEY="你的百度密钥"
 $env:OPENAI_API_KEY="你的 API Key"
 $env:OPENAI_BASE_URL="https://api.openai.com/v1" # 第三方服务改为服务商地址
 $env:OPENAI_MODEL="你的模型名称"
@@ -93,11 +102,20 @@ cd site && python -m http.server 8000
 
 > 注意：直接用文件双击打开 `index.html` 时浏览器会拦截本地 `fetch`，请用上面的 http.server 方式预览。
 
-## AI 服务配置
+## 翻译与 AI 服务配置
 
-项目调用 OpenAI Chat Completions 兼容接口。使用官方 OpenAI 时，将 `OPENAI_BASE_URL` 设置为
-`https://api.openai.com/v1`；使用第三方服务时，填写服务商提供的 API 根地址和模型名称。
-翻译与总结使用同一个模型和 API Key。
+默认翻译路由为：
+
+```text
+general=deepl,t-compiler=deepl,t-libs=baidu,t-opsem=baidu
+```
+
+可用后端包括 `deepl`、`baidu`、`openai`、`google` 和 `mymemory`。例如要让
+`t-opsem` 改用 `gpt-5.6-luna` 翻译，可将对应路由改为 `t-opsem=openai`。
+四个默认频道未被覆盖时保留上述默认路由；其他频道使用 `TRANSLATE_BACKEND`。
+
+帖子总结固定调用 OpenAI Chat Completions 兼容接口。使用第三方服务时，填写服务商提供的
+API 根地址和模型名称；`OPENAI_MODEL` 可设置为 `gpt-5.6-luna`。
 
 代码块、行内代码、URL、邮箱在翻译前会被提取保护，不会被破坏。
 

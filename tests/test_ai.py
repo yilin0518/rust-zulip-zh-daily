@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import sys
@@ -5,13 +6,15 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.parse
 from unittest.mock import patch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "scripts"))
 
 from summarize import Summarizer, SummaryCache  # noqa: E402
-from translate import OpenAITranslator  # noqa: E402
+from pipeline import parse_translation_routes  # noqa: E402
+from translate import BaiduTranslator, OpenAITranslator  # noqa: E402
 
 
 class FakeResponse:
@@ -29,6 +32,43 @@ class FakeResponse:
 
 
 class OpenAICompatibleTests(unittest.TestCase):
+    @patch.dict(os.environ, {
+        "BAIDU_APP_ID": "test-app-id",
+        "BAIDU_SECRET_KEY": "test-secret",
+    }, clear=False)
+    @patch("urllib.request.urlopen")
+    def test_baidu_request_signature_and_result(self, urlopen):
+        urlopen.return_value = FakeResponse("unused")
+        urlopen.return_value.body = json.dumps({
+            "from": "en",
+            "to": "zh",
+            "trans_result": [{"src": "Rust", "dst": "Rust 语言"}],
+        }).encode()
+
+        client = BaiduTranslator()
+        self.assertEqual(client.translate_one("Rust"), "Rust 语言")
+        request = urlopen.call_args.args[0]
+        params = urllib.parse.parse_qs(request.data.decode())
+        expected = hashlib.md5((
+            "test-app-id" + "Rust" + params["salt"][0] + "test-secret"
+        ).encode()).hexdigest()
+        self.assertEqual(request.full_url, BaiduTranslator.URL)
+        self.assertEqual(params["appid"], ["test-app-id"])
+        self.assertEqual(params["from"], ["en"])
+        self.assertEqual(params["to"], ["zh"])
+        self.assertEqual(params["sign"], [expected])
+
+    def test_translation_routes_support_openai_override(self):
+        defaults = parse_translation_routes("")
+        self.assertEqual(defaults["general"], "deepl")
+        self.assertEqual(defaults["t-compiler"], "deepl")
+        self.assertEqual(defaults["t-libs"], "baidu")
+        self.assertEqual(defaults["t-opsem"], "baidu")
+
+        routes = parse_translation_routes("t-libs=openai,t-opsem=deepl")
+        self.assertEqual(routes["t-libs"], "openai")
+        self.assertEqual(routes["t-opsem"], "deepl")
+
     @patch.dict(os.environ, {
         "OPENAI_API_KEY": "test-key",
         "OPENAI_MODEL": "test-model",
