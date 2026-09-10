@@ -58,6 +58,7 @@ rust-lang Zulip 的 API 需要登录凭据（即使频道是公开的）：
 | `STREAMS` | `general,t-compiler,t-libs,t-opsem` | 自定义频道 |
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | 第三方服务请填写其兼容 API 根地址 |
 | `OPENAI_MODEL` | 无 | 服务商提供的模型名称，必须配置 |
+| `AI_CONCURRENCY` | `4` | 同时生成帖子总结的最大请求数；遇到限流可调低 |
 
 ### 3. 启用 GitHub Pages
 
@@ -81,6 +82,7 @@ $env:TRANSLATE_BACKEND="openai"
 $env:OPENAI_API_KEY="你的 API Key"
 $env:OPENAI_BASE_URL="https://api.openai.com/v1" # 第三方服务改为服务商地址
 $env:OPENAI_MODEL="你的模型名称"
+$env:AI_CONCURRENCY="4"
 
 # 3. 运行管线（拉取 + 翻译 + 生成 site/data/）
 python scripts/pipeline.py

@@ -4,6 +4,7 @@
 import hashlib
 import json
 import os
+import threading
 
 from translate import OpenAITranslator, TranslationError
 
@@ -44,9 +45,19 @@ class SummaryCache:
 class Summarizer:
     def __init__(self, cache=None):
         self.cache = cache or SummaryCache()
-        self.client = OpenAITranslator()
+        # 启动时校验配置；每个工作线程使用自己的客户端。
+        OpenAITranslator()
+        self._local = threading.local()
+        self._lock = threading.Lock()
         self.generated = 0
         self.failed = 0
+
+    def _client(self):
+        client = getattr(self._local, "client", None)
+        if client is None:
+            client = OpenAITranslator()
+            self._local.client = client
+        return client
 
     @staticmethod
     def _transcript(messages):
@@ -64,7 +75,8 @@ class Summarizer:
             return ""
         digest = hashlib.sha256(transcript.encode("utf-8")).hexdigest()
         key = "%s|%s" % (stream, topic)
-        hit = self.cache.get(key, digest)
+        with self._lock:
+            hit = self.cache.get(key, digest)
         if hit is not None:
             return hit
         prompt = (
@@ -75,16 +87,19 @@ class Summarizer:
             % (topic, stream, transcript)
         )
         try:
-            summary = self.client.complete([
+            client = self._client()
+            summary = client.complete([
                 {"role": "system", "content": (
                     "你是 Rust 技术社区讨论总结助手。只依据用户提供的完整聊天记录进行总结，"
                     "输出简体中文 Markdown 列表，不添加聊天记录中不存在的信息。")},
                 {"role": "user", "content": prompt},
             ])
         except TranslationError as e:
-            self.failed += 1
+            with self._lock:
+                self.failed += 1
             print("[warn] AI 总结失败 %s/%s: %s" % (stream, topic, e), flush=True)
             return ""
-        self.generated += 1
-        self.cache.put(key, digest, summary, self.client.model)
+        with self._lock:
+            self.generated += 1
+            self.cache.put(key, digest, summary, client.model)
         return summary

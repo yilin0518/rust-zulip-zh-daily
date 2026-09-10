@@ -10,6 +10,7 @@
     STREAMS                       可选，逗号分隔的频道名，默认 general,t-compiler,t-libs,t-opsem
     OPENAI_API_KEY / OPENAI_MODEL 必填，翻译与总结共用
     OPENAI_BASE_URL               可选，第三方 OpenAI 兼容服务地址
+    AI_CONCURRENCY                帖子总结并发数，默认 4
 输出：
     site/data/<频道>.json         站点数据（双语）
     site/data/meta.json           元信息
@@ -20,6 +21,7 @@ import json
 import os
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from translate import Cache, Translator  # noqa: E402
@@ -52,6 +54,10 @@ def main():
 
     topics_env = os.environ.get("TOPICS_PER_STREAM", "").strip()
     limit = int(topics_env) if topics_env else 20
+    concurrency_env = os.environ.get("AI_CONCURRENCY", "").strip()
+    summary_concurrency = int(concurrency_env) if concurrency_env else 4
+    if summary_concurrency < 1:
+        sys.exit("错误：AI_CONCURRENCY 必须是大于 0 的整数")
     budget_env = os.environ.get("TRANSLATE_BUDGET_MIN", "").strip()
     budget_min = float(budget_env) if budget_env else 50.0  # 翻译总时间预算（分钟）
     streams_cfg = DEFAULT_STREAMS
@@ -81,61 +87,101 @@ def main():
         "streams": [],
     }
     total_topics = total_msgs = 0
+    stream_jobs = []
+    summary_futures = {}
 
-    for cfg in streams_cfg:
-        name = cfg["key"]
-        sid = stream_ids.get(name)
-        if sid is None:
-            print("[warn] 频道不存在，跳过: %s" % name)
-            continue
-        topics = client.get_latest_topics(sid, limit=limit)
-        out_topics = []
-        for ti, t in enumerate(topics, 1):
-            msgs = client.get_topic_messages(sid, t["name"])
-            pairs = []       # [(msg_id, en)] 待翻译
-            msg_meta = {}    # msg_id -> 消息元数据
-            for m in msgs:
-                en = (m.get("content") or "").strip()
-                if not en:
-                    continue
-                md = {
-                    "id": m["id"],
-                    "sender": m.get("sender_full_name") or "unknown",
-                    "time": m.get("timestamp"),
-                    "en": en,
+    print("AI 总结并发数: %d" % summary_concurrency, flush=True)
+    with ThreadPoolExecutor(max_workers=summary_concurrency) as executor:
+        # 第一阶段只拉取帖子并提交总结，让不同帖子的 AI 请求真正并发。
+        for cfg in streams_cfg:
+            name = cfg["key"]
+            sid = stream_ids.get(name)
+            if sid is None:
+                print("[warn] 频道不存在，跳过: %s" % name)
+                continue
+            topics = client.get_latest_topics(sid, limit=limit)
+            topic_jobs = []
+            for ti, topic in enumerate(topics, 1):
+                msgs = client.get_topic_messages(sid, topic["name"])
+                job = {"topic": topic, "messages": msgs}
+                future = executor.submit(summarizer.summarize, name, topic["name"], msgs)
+                job["summary_future"] = future
+                summary_futures[future] = (name, topic["name"], job)
+                topic_jobs.append(job)
+                print("[fetch] %s 话题 %d/%d: %s (%d 条) 已提交总结"
+                      % (name, ti, len(topics), topic["name"][:50], len(msgs)), flush=True)
+            stream_jobs.append({"name": name, "display": cfg["display"], "topics": topic_jobs})
+
+        # 第二阶段保持翻译串行，避免翻译器共享状态和缓存发生竞争。
+        stream_outputs = []
+        for stream_job in stream_jobs:
+            name = stream_job["name"]
+            out_topics = []
+            for ti, job in enumerate(stream_job["topics"], 1):
+                topic = job["topic"]
+                msgs = job["messages"]
+                pairs = []       # [(msg_id, en)] 待翻译
+                msg_meta = {}    # msg_id -> 消息元数据
+                for message in msgs:
+                    en = (message.get("content") or "").strip()
+                    if not en:
+                        continue
+                    md = {
+                        "id": message["id"],
+                        "sender": message.get("sender_full_name") or "unknown",
+                        "time": message.get("timestamp"),
+                        "en": en,
+                    }
+                    msg_meta[message["id"]] = md
+                    if budget_exhausted():
+                        md["zh"] = ""
+                    else:
+                        pairs.append((message["id"], en))
+                zhs = tr.translate_batch(pairs) if pairs else {}
+                out_msgs = []
+                for mid, md in msg_meta.items():
+                    md["zh"] = md.get("zh", zhs.get(mid, ""))
+                    out_msgs.append(md)
+                title_zh = tr.translate(topic["name"], cache_key="t|%s|%s" % (name, topic["name"]))
+                out_topic = {
+                    "name": topic["name"],
+                    "name_zh": title_zh,
+                    "summary": "",
+                    "count": len(out_msgs),
+                    "first": topic["first"],
+                    "last": topic["last"],
+                    "messages": out_msgs,
                 }
-                msg_meta[m["id"]] = md
-                if budget_exhausted():
-                    # 时间预算耗尽：不再翻译，剩余消息保留英文（站点仍可正常访问）
-                    md["zh"] = ""
-                else:
-                    pairs.append((m["id"], en))
-            zhs = tr.translate_batch(pairs) if pairs else {}
-            out_msgs = []
-            for mid, md in msg_meta.items():
-                md["zh"] = md.get("zh", zhs.get(mid, ""))
-                out_msgs.append(md)
-            summary = summarizer.summarize(name, t["name"], msgs)
-            title_zh = tr.translate(t["name"], cache_key="t|%s|%s" % (name, t["name"]))
-            out_topics.append({
-                "name": t["name"],
-                "name_zh": title_zh,
-                "summary": summary,
-                "count": len(out_msgs),
-                "first": t["first"],
-                "last": t["last"],
-                "messages": out_msgs,
+                job["output"] = out_topic
+                out_topics.append(out_topic)
+                print("[progress] %s 话题 %d/%d: %s (%d 条) 翻译完成，已用 %.1f 分钟"
+                      % (name, ti, len(stream_job["topics"]), topic["name"][:50], len(out_msgs),
+                         (time.time() - t0) / 60.0), flush=True)
+            stream_outputs.append({
+                "name": name,
+                "data": {"stream": name, "display": stream_job["display"], "topics": out_topics},
             })
-            print("[progress] %s 话题 %d/%d: %s (%d 条) 已用 %.1f 分钟"
-                  % (name, ti, len(topics), t["name"][:50], len(out_msgs),
-                     (time.time() - t0) / 60.0), flush=True)
 
-        stream_data = {"stream": name, "display": cfg["display"], "topics": out_topics}
+        completed = 0
+        for future in as_completed(summary_futures):
+            name, topic_name, job = summary_futures[future]
+            try:
+                job["output"]["summary"] = future.result()
+            except Exception as e:
+                print("[warn] AI 总结任务异常 %s/%s: %s" % (name, topic_name, e), flush=True)
+            completed += 1
+            print("[summary] %d/%d: %s/%s" % (
+                completed, len(summary_futures), name, topic_name[:50]), flush=True)
+
+    for stream_output in stream_outputs:
+        name = stream_output["name"]
+        stream_data = stream_output["data"]
+        out_topics = stream_data["topics"]
         with open(os.path.join(SITE_DATA, name + ".json"), "w", encoding="utf-8") as f:
             json.dump(stream_data, f, ensure_ascii=False)
         msg_count = sum(x["count"] for x in out_topics)
         meta["streams"].append({
-            "key": name, "display": cfg["display"], "file": name + ".json",
+            "key": name, "display": stream_data["display"], "file": name + ".json",
             "topics": len(out_topics), "messages": msg_count,
         })
         total_topics += len(out_topics)

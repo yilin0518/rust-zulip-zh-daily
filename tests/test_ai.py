@@ -2,6 +2,8 @@ import json
 import os
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -50,17 +52,57 @@ class OpenAICompatibleTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             summarizer = Summarizer(SummaryCache(os.path.join(directory, "cache.json")))
             prompts = []
-            summarizer.client.complete = lambda messages: prompts.append(messages) or "- 总结"
             messages = [
                 {"sender_full_name": "Alice", "content": "first message"},
                 {"sender_full_name": "Bob", "content": "last message"},
             ]
-            self.assertEqual(summarizer.summarize("general", "topic", messages), "- 总结")
-            user_prompt = prompts[0][1]["content"]
-            self.assertIn("first message", user_prompt)
-            self.assertIn("last message", user_prompt)
-            self.assertEqual(summarizer.summarize("general", "topic", messages), "- 总结")
-            self.assertEqual(len(prompts), 1)
+            with patch.object(OpenAITranslator, "complete",
+                              side_effect=lambda messages: prompts.append(messages) or "- 总结"):
+                self.assertEqual(summarizer.summarize("general", "topic", messages), "- 总结")
+                user_prompt = prompts[0][1]["content"]
+                self.assertIn("first message", user_prompt)
+                self.assertIn("last message", user_prompt)
+                self.assertEqual(summarizer.summarize("general", "topic", messages), "- 总结")
+                self.assertEqual(len(prompts), 1)
+
+    @patch.dict(os.environ, {
+        "OPENAI_API_KEY": "test-key",
+        "OPENAI_MODEL": "test-model",
+    }, clear=False)
+    def test_concurrent_summaries_keep_topic_results_separate(self):
+        active = 0
+        peak = 0
+        lock = threading.Lock()
+
+        def complete(messages):
+            nonlocal active, peak
+            prompt = messages[1]["content"]
+            topic = prompt.splitlines()[0].removeprefix("话题：")
+            with lock:
+                active += 1
+                peak = max(peak, active)
+            time.sleep(0.02 if topic == "slow" else 0.005)
+            with lock:
+                active -= 1
+            return "- " + topic
+
+        with tempfile.TemporaryDirectory() as directory:
+            summarizer = Summarizer(SummaryCache(os.path.join(directory, "cache.json")))
+            topics = ("slow", "fast", "middle")
+            with patch.object(OpenAITranslator, "complete", side_effect=complete):
+                from concurrent.futures import ThreadPoolExecutor, as_completed
+                with ThreadPoolExecutor(max_workers=3) as executor:
+                    futures = {
+                        executor.submit(summarizer.summarize, "general", topic, [
+                            {"sender_full_name": "Alice", "content": topic + " message"},
+                        ]): topic
+                        for topic in topics
+                    }
+                    results = {futures[future]: future.result()
+                               for future in as_completed(futures)}
+
+            self.assertGreater(peak, 1)
+            self.assertEqual(results, {topic: "- " + topic for topic in topics})
 
 
 if __name__ == "__main__":
