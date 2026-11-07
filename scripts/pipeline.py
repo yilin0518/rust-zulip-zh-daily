@@ -13,12 +13,12 @@
     AI_CONCURRENCY                帖子总结并发数，默认 4
     STREAM_TRANSLATE_BACKENDS     按频道选择翻译后端，格式 stream=backend,...
 输出：
-    site/data/<频道>.json         站点数据（双语）
+    site/data/stream-*.json       轻量话题目录
+    site/data/topics/*.json      按需加载的话题正文（双语）
     site/data/meta.json           元信息
     data/translation_cache.json   翻译缓存（需提交到仓库，避免重复翻译）
     data/summary_cache.json       帖子总结缓存
 """
-import json
 import os
 import sys
 import time
@@ -28,6 +28,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from translate import Cache, Translator  # noqa: E402
 from summarize import Summarizer  # noqa: E402
 from zulip_client import ZulipClient  # noqa: E402
+from site_data import write_site_data  # noqa: E402
+from update_report import build_report, write_report  # noqa: E402
 
 if hasattr(sys.stdout, "reconfigure"):
     try:
@@ -71,8 +73,8 @@ def valid_backend_spec(spec):
             and (len(parts) == 1 or "auto" not in parts))
 
 
-def parse_translation_routes(raw):
-    routes = dict(DEFAULT_TRANSLATION_ROUTES)
+def parse_translation_routes(raw, default_backend="mymemory"):
+    routes = {key: default_backend for key in DEFAULT_TRANSLATION_ROUTES}
     if not raw:
         return routes
     for entry in raw.split(","):
@@ -113,7 +115,7 @@ def main():
         sys.exit("错误：无效翻译后端: %s" % default_backend)
     try:
         translation_routes = parse_translation_routes(
-            os.environ.get("STREAM_TRANSLATE_BACKENDS", "").strip())
+            os.environ.get("STREAM_TRANSLATE_BACKENDS", "").strip(), default_backend)
         stream_backends = {
             cfg["key"]: translation_routes.get(cfg["key"], default_backend)
             for cfg in streams_cfg
@@ -133,6 +135,8 @@ def main():
         sys.exit("错误：翻译后端初始化失败——%s" % e)
 
     t0 = time.time()
+    for translator in translators.values():
+        translator.deadline = t0 + budget_min * 60
 
     def budget_exhausted():
         return (time.time() - t0) / 60.0 > budget_min
@@ -141,10 +145,7 @@ def main():
     stream_ids = client.get_streams()
     os.makedirs(SITE_DATA, exist_ok=True)
 
-    meta = {
-        "last_updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "streams": [],
-    }
+    updated_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     total_topics = total_msgs = 0
     stream_jobs = []
     summary_futures = {}
@@ -194,7 +195,10 @@ def main():
                         "en": en,
                     }
                     msg_meta[message["id"]] = md
-                    if budget_exhausted():
+                    cached = cache.get(message["id"], en)
+                    if cached is not None:
+                        md["zh"] = cached
+                    elif budget_exhausted():
                         md["zh"] = ""
                     else:
                         pairs.append((message["id"], en))
@@ -239,21 +243,18 @@ def main():
         name = stream_output["name"]
         stream_data = stream_output["data"]
         out_topics = stream_data["topics"]
-        with open(os.path.join(SITE_DATA, name + ".json"), "w", encoding="utf-8") as f:
-            json.dump(stream_data, f, ensure_ascii=False)
         msg_count = sum(x["count"] for x in out_topics)
-        meta["streams"].append({
-            "key": name, "display": stream_data["display"], "file": name + ".json",
-            "topics": len(out_topics), "messages": msg_count,
-        })
         total_topics += len(out_topics)
         total_msgs += msg_count
         print("[ok] %s: %d 个话题, %d 条消息" % (name, len(out_topics), msg_count), flush=True)
 
-    with open(os.path.join(SITE_DATA, "meta.json"), "w", encoding="utf-8") as f:
-        json.dump(meta, f, ensure_ascii=False)
     cache.save()
     summarizer.cache.save()
+    output = [item["data"] for item in stream_outputs]
+    report = build_report(output, cache)
+    report_path = os.environ.get("UPDATE_REPORT_PATH") or os.path.join(ROOT, "work", "update-report.json")
+    write_report(report, report_path)
+    write_site_data(output, SITE_DATA, updated_at=updated_at)
 
     print("\n完成：%d 个频道, %d 个话题, %d 条消息" % (len(streams_cfg), total_topics, total_msgs), flush=True)
     for backend, translator in translators.items():
@@ -265,6 +266,8 @@ def main():
     if budget_exhausted():
         print("[warn] 翻译时间预算（%s 分钟）已耗尽，部分消息保留英文原文" % budget_min, flush=True)
     print("站点数据已写入 %s" % SITE_DATA, flush=True)
+    if os.environ.get("REQUIRE_COMPLETE_TRANSLATIONS", "").lower() in ("1", "true", "yes") and not report["complete"]:
+        sys.exit("Content is incomplete; caches were saved. Deployment is blocked until the next successful run.")
 
 
 if __name__ == "__main__":
