@@ -1,72 +1,56 @@
-name: daily-update
-# 每天 06:00 UTC（北京时间 14:00）自动更新一次；也可在 Actions 页手动 “Run workflow” 立即更新。
+name: publish-site
+
 on:
-  schedule:
-    - cron: '0 6 * * *'
+  push:
+    branches: [main]
+    paths:
+      - 'data/site_snapshot.json'
+      - 'site/**'
+      - 'scripts/**'
+      - 'tests/**'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'tsconfig.json'
+      - 'vite.config.ts'
+      - '.github/workflows/daily.yml'
   workflow_dispatch:
-    inputs:
-      translation_backend:
-        description: '本次运行用于新增消息的翻译后端'
-        required: true
-        default: 'mymemory'
-        type: choice
-        options:
-          - mymemory
-          - openai
-          - mymemory+openai
 
 permissions:
-  contents: write
+  contents: read
   pages: write
   id-token: write
 
 concurrency:
-  group: daily-update
+  group: pages-publish
   cancel-in-progress: true
 
 jobs:
-  update:
+  build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-
-      - name: 运行数据管线（拉取 + 翻译 + 生成站点数据）
-        run: python scripts/pipeline.py
-        env:
-          ZULIP_EMAIL: ${{ secrets.ZULIP_EMAIL }}
-          ZULIP_API_KEY: ${{ secrets.ZULIP_API_KEY }}
-          TOPICS_PER_STREAM: ${{ vars.TOPICS_PER_STREAM }}
-          STREAMS: ${{ vars.STREAMS }}
-          TRANSLATE_BACKEND: ${{ inputs.translation_backend || 'mymemory' }}
-          STREAM_TRANSLATE_BACKENDS: ${{ inputs.translation_backend == 'openai' && 'general=openai,t-compiler=openai,t-libs=openai,t-opsem=openai' || inputs.translation_backend == 'mymemory+openai' && 'general=mymemory+openai,t-compiler=mymemory+openai,t-libs=mymemory+openai,t-opsem=mymemory+openai' || 'general=mymemory,t-compiler=mymemory,t-libs=mymemory,t-opsem=mymemory' }}
-          TRANSLATE_BUDGET_MIN: '240'
-          MYMEMORY_EMAIL: ${{ vars.MYMEMORY_EMAIL }}
-          DEEPL_API_KEY: ${{ secrets.DEEPL_API_KEY }}
-          BAIDU_APP_ID: ${{ secrets.BAIDU_APP_ID }}
-          BAIDU_SECRET_KEY: ${{ secrets.BAIDU_SECRET_KEY }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          OPENAI_BASE_URL: ${{ vars.OPENAI_BASE_URL }}
-          OPENAI_MODEL: ${{ vars.OPENAI_MODEL }}
-          AI_CONCURRENCY: ${{ vars.AI_CONCURRENCY || '4' }}
-
-      - name: 提交翻译与总结缓存（避免重复调用 AI）
-        run: |
-          git config user.name "rust-zulip-daily-bot"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add data
-          git diff --cached --quiet && echo "缓存无变化" || { git commit -m "chore: 更新翻译缓存 $(date -u +%Y-%m-%d_%H%M)" && git push; }
-
-      - name: 上传站点产物
-        uses: actions/upload-pages-artifact@v3
+      - uses: actions/setup-node@v4
         with:
-          path: site
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - name: 检查代码与更新流程
+        run: |
+          npm test
+          python -m unittest discover -s tests
+      - name: 从本机提交的快照生成站点数据
+        run: python scripts/manual_update.py render
+      - name: 构建阅读站点
+        run: npm run build
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
 
   deploy:
-    needs: update
+    needs: build
     runs-on: ubuntu-latest
     environment:
       name: github-pages
@@ -74,3 +58,4 @@ jobs:
     steps:
       - id: deployment
         uses: actions/deploy-pages@v4
+

@@ -34,9 +34,10 @@ class ZulipClient:
             raise ZulipError("缺少 ZULIP_EMAIL / ZULIP_API_KEY")
         token = base64.b64encode(("%s:%s" % (email, api_key)).encode("utf-8")).decode("ascii")
         self.headers = {"User-Agent": UA, "Authorization": "Basic " + token}
+        self.base = BASE
 
     def _request(self, path, params=None):
-        url = BASE + path
+        url = self.base + path
         if params:
             url += "?" + urllib.parse.urlencode(params, doseq=True)
         last = None
@@ -101,23 +102,44 @@ class ZulipClient:
         return ordered[:limit]
 
     def get_topic_messages(self, stream_id, topic, max_msgs=1000):
-        """返回某话题的全部消息（按时间正序），单话题最多 max_msgs 条。"""
+        """返回话题最近 max_msgs 条消息（按时间正序），保证长话题仍会更新。"""
         narrow = json.dumps([
             {"operator": "stream", "operand": stream_id},
             {"operator": "topic", "operand": topic},
         ])
         out = []
-        anchor = "oldest"
+        anchor = "newest"
         while len(out) < max_msgs:
-            params = {"anchor": anchor, "num_after": 1000,
+            page_size = min(1000, max_msgs - len(out))
+            params = {"anchor": anchor, "num_before": page_size,
+                      "num_after": 0, "include_anchor": "false",
                       "apply_markdown": "false", "narrow": narrow}
             msgs = self._request("/messages", params).get("messages", [])
             if not msgs:
                 break
             out.extend(msgs)
-            if len(msgs) < 1000:
+            if len(msgs) < page_size:
                 break
-            newest = max(m["id"] for m in msgs)
-            anchor = str(newest + 1)
+            anchor = str(min(m["id"] for m in msgs))
             time.sleep(0.15)
-        return out[:max_msgs]
+        return sorted({m["id"]: m for m in out}.values(), key=lambda m: m["id"])[-max_msgs:]
+
+
+class PublicZulipClient(ZulipClient):
+    """Read web-public channels using the same anonymous endpoint as the Zulip website."""
+    def __init__(self, streams):
+        self.base = "https://rust-lang.zulipchat.com/json"
+        self.headers = {"User-Agent": UA}
+        self.streams = streams
+
+    def get_streams(self):
+        # Message narrows accept channel names; anonymous stream discovery is not required.
+        return {name: name for name in self.streams}
+
+    def _request(self, path, params=None):
+        if path != "/messages":
+            raise ZulipError("Anonymous client only supports public message reads")
+        params = dict(params or {})
+        narrow = json.loads(params.get("narrow", "[]"))
+        params["narrow"] = json.dumps([{"operator": "streams", "operand": "web-public"}] + narrow)
+        return super()._request(path, params)

@@ -7,7 +7,7 @@
 
 健壮性设计（2026-09 修订，修复云端挂起问题）：
 - 启动时对每个后端做健康探测（probe），探测失败的后端本次运行直接跳过；
-- 所有后端探测均失败时立即报错退出（保留上一次已部署的数据，避免静默产出英文站）；
+- 探测失败和额度耗尽会记录原因；更新完整性由主管线检查；
 - 普通翻译请求超时 12s，OpenAI 兼容请求超时 120s，并带有限重试；
 - 运行中某后端连续失败会被标记为失效，不再反复慢速重试。
 
@@ -67,7 +67,25 @@ COOLDOWN_BASE = 15
 
 
 class TranslationError(Exception):
-    pass
+    def __init__(self, message, permanent=False, retry_after=None):
+        super().__init__(message)
+        self.permanent = permanent
+        self.retry_after = retry_after
+
+
+def _utf8_chunks(text, limit=500):
+    """MyMemory limits UTF-8 bytes, not Python characters. Preserve every character."""
+    result, current, size = [], [], 0
+    for char in text:
+        width = len(char.encode("utf-8"))
+        if current and size + width > limit:
+            result.append("".join(current))
+            current, size = [], 0
+        current.append(char)
+        size += width
+    if current:
+        result.append("".join(current))
+    return result
 
 
 # ---------------- 文本分段 ----------------
@@ -234,6 +252,9 @@ class MyMemoryTranslator:
     URL = "https://api.mymemory.translated.net/get"
 
     def translate_one(self, text):
+        return "".join(self._translate_chunk(chunk) for chunk in _utf8_chunks(text))
+
+    def _translate_chunk(self, text):
         params = [("q", text), ("langpair", "en|zh-CN")]
         email = os.environ.get("MYMEMORY_EMAIL", "").strip()
         if email:
@@ -244,6 +265,8 @@ class MyMemoryTranslator:
                 req = urllib.request.Request(url, headers={"User-Agent": UA})
                 with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
                     parsed = json.loads(r.read().decode("utf-8", "replace"))
+                if parsed.get("quotaFinished"):
+                    raise TranslationError("mymemory daily quota exhausted", permanent=True)
                 if parsed.get("responseStatus") != 200:
                     raise TranslationError("mymemory status=%s" % parsed.get("responseStatus"))
                 out = parsed.get("responseData", {}).get("translatedText", "")
@@ -365,7 +388,7 @@ class OpenAITranslator:
             "model": self.model,
             "messages": messages,
         }).encode("utf-8")
-        for attempt in range(2):
+        for attempt in range(4):
             try:
                 req = urllib.request.Request(
                     self.url, data=payload, headers={
@@ -378,12 +401,18 @@ class OpenAITranslator:
                     raise TranslationError("openai 返回空结果")
                 return content.strip()
             except urllib.error.HTTPError as e:
-                if e.code in (429, 500, 502, 503) and attempt < 1:
-                    time.sleep(2)
+                if e.code in (429, 500, 502, 503, 504) and attempt < 3:
+                    try:
+                        delay = float(e.headers.get("Retry-After", 2 ** (attempt + 1)))
+                    except (TypeError, ValueError, AttributeError):
+                        delay = 2 ** (attempt + 1)
+                    print("[warn] AI HTTP %s; retry %d/3" % (e.code, attempt + 1), flush=True)
+                    time.sleep(max(0, min(delay, 60)))
                     continue
-                raise TranslationError("openai http %s: %s" % (e.code, e.read()[:200]))
+                raise TranslationError("openai http %s" % e.code,
+                                       permanent=e.code in (400, 401, 403, 404))
             except (urllib.error.URLError, ValueError, KeyError, OSError) as e:
-                if attempt < 1:
+                if attempt < 3:
                     time.sleep(1)
                     continue
                 raise TranslationError("openai 错误: %s" % e)
@@ -426,7 +455,8 @@ def build_backends(name=None):
         except TranslationError as e:
             errors.append("%s: %s" % (part, e))
     if not backends:
-        raise TranslationError("翻译后端初始化失败（%s）" % "; ".join(errors))
+        print("[warn] 翻译后端无法初始化，将保留英文原文（%s）"
+              % "; ".join(errors), flush=True)
     return backends
 
 
@@ -448,12 +478,14 @@ class Cache:
         v = self.data.get(str(key))
         if not isinstance(v, dict):
             return None
+        if v.get("complete") is False:
+            return None
         if src is not None and v.get("en") != src:
             return None
         return v.get("zh")
 
     def put(self, key, src, zh, backend):
-        self.data[str(key)] = {"en": src, "zh": zh, "backend": backend}
+        self.data[str(key)] = {"en": src, "zh": zh, "backend": backend, "complete": True}
 
     def save(self):
         d = os.path.dirname(self.path)
@@ -470,6 +502,11 @@ class Translator:
         self.cache = cache or Cache()
         self.backends = build_backends(backend)
         self.stats = {"backend": {}, "chars": 0, "failed": 0}
+        self.deadline = float("inf")
+        self._ai_budget = int(os.environ.get("OPENAI_TRANSLATION_CHAR_BUDGET") or 0)
+        if self._ai_budget < 0:
+            raise TranslationError("OPENAI_TRANSLATION_CHAR_BUDGET must be non-negative")
+        self._ai_chars = 0
         self._dead = {b.name: False for b in self.backends}
         self._consec = {b.name: 0 for b in self.backends}
         self._cooldown_until = {b.name: 0.0 for b in self.backends}
@@ -485,7 +522,8 @@ class Translator:
             try:
                 out = b.translate_one(probe_text)
                 ok = bool(out and out.strip())
-            except TranslationError:
+            except TranslationError as e:
+                print("[warn] %s probe failed: %s" % (b.name, e), flush=True)
                 ok = False
             except Exception:
                 ok = False
@@ -496,9 +534,9 @@ class Translator:
                 print("[backend] %s 不可用，本次运行跳过" % b.name, flush=True)
         alive_names = [n for n, a in self._dead.items() if not a]
         if not alive_names:
-            raise TranslationError(
-                "所有翻译后端均不可用（%s）。请检查网络和所选后端的凭据。"
-                % ",".join(self._dead.keys()))
+            print("[warn] 所有翻译后端均不可用；继续生成网页，未翻译内容保留英文原文",
+                  flush=True)
+            return
         chunk_limits = {
             "google": GOOGLE_CHUNK_LIMIT,
             "openai": OPENAI_CHUNK_LIMIT,
@@ -513,6 +551,46 @@ class Translator:
               % (",".join(alive_names), self._chunk_limit, PACING.get(alive_names[0], 0.2)),
               flush=True)
 
+    def _ready_backends(self):
+        """Wait for a live backend rather than silently skipping the rest of the feed."""
+        while time.time() < self.deadline:
+            alive = [b for b in self.backends if not self._dead[b.name]]
+            if not alive:
+                return []
+            now = time.time()
+            ready = [b for b in alive if now >= self._cooldown_until[b.name]]
+            if ready:
+                return ready
+            delay = min(self._cooldown_until[b.name] - now for b in alive)
+            time.sleep(max(0, min(delay, self.deadline - now, 10)))
+        return []
+
+    def _failure(self, backend, error):
+        name = backend.name
+        self._consec[name] += 1
+        self._dead[name] = error.permanent or self._consec[name] >= DEAD_AFTER_CONSEC
+        delay = error.retry_after or COOLDOWN_BASE * self._consec[name]
+        self._cooldown_until[name] = time.time() + min(float(delay), 60)
+        print("[warn] %s: %s (%s)" % (
+            name, error, "disabled for this run" if self._dead[name] else "cooldown; will retry"),
+            flush=True)
+
+    def _charge_ai(self, chars):
+        if self._ai_budget and self._ai_chars + chars > self._ai_budget:
+            self._dead["openai"] = True
+            print("[warn] OpenAI translation character budget exhausted; pending work will retry next run",
+                  flush=True)
+            return False
+        self._ai_chars += chars
+        return True
+
+    def _success(self, backend, chars):
+        self._consec[backend.name] = 0
+        self._cooldown_until[backend.name] = 0.0
+        self._last_backend = backend.name
+        self.stats["backend"][backend.name] = self.stats["backend"].get(backend.name, 0) + 1
+        self.stats["chars"] += chars
+
     def translate(self, text, cache_key=None):
         """翻译单条文本。cache_key 非空时按 key 缓存（key 通常为消息 id 或标题键）。"""
         text = (text or "").strip()
@@ -522,7 +600,7 @@ class Translator:
             hit = self.cache.get(cache_key, text)
             if hit is not None:
                 return hit
-        before = sum(self.stats["backend"].values())
+        failed_before = self.stats["failed"]
         segments = split_segments(text)
         outs = []
         for seg, keep in segments:
@@ -530,42 +608,30 @@ class Translator:
                 outs.append(seg)  # 代码/URL/空段原样保留
             else:
                 translated = [self._translate_seg(c) for c in _chunk(seg, self._chunk_limit)]
-                outs.append("".join(translated))
-        zh = apply_simp(apply_glossary("".join(outs))).strip()
-        # 只有实际发生了翻译（至少一次后端成功）才写缓存；
-        # 失败的翻译若写入缓存会把英文当译文缓存，导致下次运行跳过重译。
-        translated_any = sum(self.stats["backend"].values()) > before
-        if cache_key is not None and translated_any:
+                outs.append(apply_simp(apply_glossary("".join(translated))))
+        zh = "".join(outs).strip()
+        # A partially translated message must remain eligible for retries.
+        if cache_key is not None and self.stats["failed"] == failed_before:
             self.cache.put(cache_key, text, zh, self._last_backend)
         return zh
 
     def _translate_seg(self, seg):
         if not seg.strip():
             return seg
-        now = time.time()
-        for b in self.backends:
-            if self._dead.get(b.name) or now < self._cooldown_until[b.name]:
-                continue
-            try:
-                out = b.translate_one(seg)
-                self._consec[b.name] = 0
-                self._cooldown_until[b.name] = 0.0
-                self._last_backend = b.name
-                self.stats["backend"][b.name] = self.stats["backend"].get(b.name, 0) + 1
-                self.stats["chars"] += len(seg)
-                pace = PACING.get(b.name, 0.2)
-                if pace > 0:
-                    time.sleep(pace)  # 节流：避免突发请求触发限流
-                return out
-            except TranslationError:
-                self._consec[b.name] += 1
-                if self._consec[b.name] >= DEAD_AFTER_CONSEC:
-                    self._dead[b.name] = True
-                    print("[warn] 后端 %s 连续 %d 次失败，本次运行禁用"
-                          % (b.name, DEAD_AFTER_CONSEC), flush=True)
-                else:
-                    self._cooldown_until[b.name] = now + COOLDOWN_BASE * self._consec[b.name]
-                time.sleep(0.2)
+        while True:
+            ready = self._ready_backends()
+            if not ready:
+                break
+            for b in ready:
+                if b.name == "openai" and not self._charge_ai(len(seg)):
+                    continue
+                try:
+                    out = b.translate_one(seg)
+                    self._success(b, len(seg))
+                    time.sleep(PACING.get(b.name, 0.2))
+                    return out
+                except TranslationError as error:
+                    self._failure(b, error)
         self.stats["failed"] += 1
         return seg  # 全部失败：保留原文，下轮再试
 
@@ -593,41 +659,61 @@ class Translator:
             todo.append((key, text))
         if not todo:
             return result
-        alive = [b for b in self.backends if not self._dead.get(b.name)]
-        ai = alive[0] if alive and alive[0].name == "openai" else None
-        if ai is None:
-            for key, text in todo:
+        offset = 0
+        while offset < len(todo):
+            ready = self._ready_backends()
+            ai = ready[0] if ready and ready[0].name == "openai" else None
+            if ai is None:
+                key, text = todo[offset]
                 result[key] = self.translate(text, cache_key=key)
-            return result
-        batch, chars = [], 0
-        for key, text in todo:
-            if len(batch) >= max_msgs or (batch and chars + len(text) > max_chars):
-                self._flush_batch(ai, batch, result)
-                batch, chars = [], 0
-            batch.append((key, text))
-            chars += len(text)
-        if batch:
+                offset += 1
+                continue
+            batch, chars = [], 0
+            while offset < len(todo):
+                key, text = todo[offset]
+                if batch and (len(batch) >= max_msgs or chars + len(text) > max_chars):
+                    break
+                batch.append((key, text))
+                chars += len(text)
+                offset += 1
             self._flush_batch(ai, batch, result)
         return result
 
     def _flush_batch(self, ai, batch, result):
-        numbered = ["【消息#%d】\n%s" % (i, text) for i, (_, text) in enumerate(batch, 1)]
+        protected = {}
+        numbered = []
+        for index, (_, text) in enumerate(batch, 1):
+            parts, keep = [], {}
+            for segment, preserve in split_segments(text):
+                if preserve:
+                    marker = "RZKEEP_%s_%d_END" % (hashlib.sha256(text.encode()).hexdigest()[:12], len(keep))
+                    keep[marker] = segment
+                    parts.append(marker)
+                else:
+                    parts.append(segment)
+            protected[index] = keep
+            numbered.append("【消息#%d】\n%s" % (index, "".join(parts)))
         prompt = ("以下是来自 Rust 编程语言社区的多条英文消息，请逐条翻译成自然、地道的简体中文。"
-                  "代码、标识符、文件名、URL、邮箱保持原样。"
+                  "RZKEEP_ 开头的占位符必须逐字保留，不要翻译或改写。"
                   "输出格式：每条译文前必须保留输入中的标记（如【消息#1】），一行一个标记，"
                   "标记后接该条译文。不要输出任何其他内容。\n\n"
                   + "\n".join(numbered))
-        try:
-            out = ai.translate_one(prompt)
-            parsed = self._parse_batch(out, len(batch))
-        except TranslationError:
-            parsed = {}
-        self.stats["backend"]["openai"] = self.stats["backend"].get("openai", 0) + 1
-        self.stats["chars"] += sum(len(text) for _, text in batch)
+        parsed = {}
+        if self._charge_ai(sum(len(text) for _, text in batch)):
+            try:
+                out = ai.translate_one(prompt)
+                parsed = self._parse_batch(out, len(batch))
+                self._success(ai, sum(len(text) for _, text in batch))
+            except TranslationError as error:
+                self._failure(ai, error)
         for i, (key, text) in enumerate(batch, 1):
             zh = parsed.get(i)
+            if zh and any(zh.count(marker) != 1 for marker in protected[i]):
+                zh = None
             if zh:
                 zh = apply_simp(apply_glossary(zh)).strip()
+                for marker, segment in protected[i].items():
+                    zh = zh.replace(marker, segment)
                 result[key] = zh
                 self.cache.put(key, text, zh, "openai")
             else:

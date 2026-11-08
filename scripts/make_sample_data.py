@@ -1,7 +1,9 @@
 # -*- coding: utf-8 -*-
 """生成本地开发用的样例数据（无凭据时预览界面用）：python scripts/make_sample_data.py
 会写入 site/data/*.json；运行真实管线（pipeline.py）后会覆盖。"""
-import json, os, time
+import os
+import time
+from site_data import write_site_data
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT = os.path.join(ROOT, "site", "data")
@@ -99,20 +101,8 @@ streams = {
     },
 }
 
-meta = {
-    "last_updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-    "streams": [],
-}
-for key, s in streams.items():
-    for t in s["topics"]:
-        t["count"] = len(t["messages"])
-        t["first"] = t["messages"][0]["time"]
-        t["last"] = t["messages"][-1]["time"]
-    with open(os.path.join(OUT, key + ".json"), "w", encoding="utf-8") as f:
-        json.dump({"stream": key, "display": s["display"], "topics": s["topics"]}, f, ensure_ascii=False)
-    meta["streams"].append({"key": key, "display": s["display"], "file": key + ".json",
-                            "topics": len(s["topics"]),
-                            "messages": sum(t["count"] for t in s["topics"])})
-with open(os.path.join(OUT, "meta.json"), "w", encoding="utf-8") as f:
-    json.dump(meta, f, ensure_ascii=False)
-print("样例数据已生成:", [x["file"] for x in meta["streams"]])
+write_site_data([
+    {"stream": key, "display": stream["display"], "topics": stream["topics"]}
+    for key, stream in streams.items()
+], OUT, sample=True)
+print("Sample catalogs and topic details generated in:", OUT)

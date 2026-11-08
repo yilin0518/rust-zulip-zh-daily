@@ -1,0 +1,28 @@
+{
+  "name": "rust-zulip-zh-daily",
+  "version": "2.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "vue-tsc --noEmit && vite build && node scripts/build_frontend.mjs",
+    "preview": "vite preview --host 127.0.0.1",
+    "test": "vitest run",
+    "format": "prettier --write \"site/src/**/*.{vue,ts,css}\" vite.config.ts"
+  },
+  "dependencies": {
+    "@lucide/vue": "^1.70.0",
+    "highlight.js": "^11.11.1",
+    "markdown-it": "^14.1.0",
+    "vue": "^3.5.0"
+  },
+  "devDependencies": {
+    "@types/markdown-it": "^14.1.2",
+    "@vitejs/plugin-vue": "^5.2.0",
+    "prettier": "^3.9.10",
+    "typescript": "~5.7.3",
+    "vite": "^6.1.0",
+    "vitest": "^3.0.0",
+    "vue-tsc": "^2.2.0"
+  }
+}

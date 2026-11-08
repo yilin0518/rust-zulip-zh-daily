@@ -1,148 +1,104 @@
 # Rust Zulip 中文日报
 
-> 运行方式：首次在 GitHub Actions 手动选择 `openai`，用配置的模型（如
-> `gpt-5.6-luna`）建立翻译缓存；后续定时任务默认使用 `mymemory`，仅翻译新增或
-> 内容变化的消息。手动运行也可选择 `mymemory+openai`，在 MyMemory 失败时自动
-> 切换 OpenAI。翻译缓存不绑定后端，切换选项不会重新翻译已有内容。每个话题详情
-> 还提供“在 Zulip 查看原帖”链接。
+用中文跟进 [rust-lang Zulip](https://rust-lang.zulipchat.com/) 的技术讨论。
+网站提供中文话题摘要、逐条中英对照、收藏和阅读进度。
 
-把 [rust-lang Zulip](https://rust-lang.zulipchat.com/) 社区每天的最新讨论**自动翻译成中文并生成 AI 总结**，
-以双语网页形式展示：左侧频道 + 话题导航（英文/中文标题），右侧查看话题完整对话（中文翻译为主、英文原文保留）。
+**当前采用按需更新：需要时让 Codex 在本机获取讨论、翻译和总结，然后提交快照；
+GitHub Actions 仅构建和发布，不再每日自动抓取，也不调用付费 AI API。**
 
-覆盖频道：`general`、`t-compiler`、`t-libs`、`t-opsem`，每频道最新 **20** 个话题（可配置）。
+网站：[Rust Zulip 中文日报](https://yilin0518.github.io/rust-zulip-zh-daily/)
 
-## 功能
+## 需要更新时
 
-- 每日自动更新（GitHub Actions 定时 06:00 UTC = 北京时间 14:00），也可在 Actions 页手动点 “Run workflow” 立即更新
-- 左侧导航：频道分组 + 话题列表（英文标题 + 中文标题 + 消息数 + 最后活跃时间），支持中英文搜索
-- 右侧对话：每条消息中英文对照，可一键切换「双语 / 中文 / English」
-- 帖子总结：将话题内全部英文聊天原文发送给 AI，生成主要内容、结论及待解决问题的中文摘要
-- 翻译缓存：已翻译的消息不会重复翻译，增量更新极快
-- 默认使用 MyMemory 翻译；手动运行可选择 OpenAI 或 `mymemory+openai` 降级链
-- DeepL 和百度翻译仍作为可选后端；帖子总结使用 OpenAI 兼容接口
-- 每个话题详情页提供对应的 Zulip 原帖链接
+在 Codex 中打开本仓库，告诉它：
+
+> 按 docs/UPDATING.md 更新日报并推送到远程。
+
+完整步骤见 [按需更新说明](docs/UPDATING.md)。首次使用可以只更新指定频道和话题数。
+本机更新过程不调用翻译或 AI API；由 Codex 本身完成语言工作，消耗当前订阅的使用额度。
+Zulip 公开频道默认匿名读取；已有 bot 凭据时也可以使用认证读取。
+
+## 阅读功能
+
+- 中文标题和摘要优先的首页；频道筛选、中英文标题/摘要搜索，以及最近更新/消息数排序。
+- 默认中文阅读，英文原文可逐条展开，也可切换双语或 English。
+- 收藏、未读消息和继续阅读，阅读偏好保存在当前浏览器，不跨设备同步。
+- 每话题与每条消息都有固定链接，支持 GitHub Pages 子路径、直接访问和刷新。
+- 话题正文按需加载，每次先展示 60 条，再继续加载；支持跳到最新消息。
+- 引用折叠、Rust 代码高亮、代码复制、字号调整、深浅主题和手机布局。
+
+默认读取 `general`、`t-compiler`、`t-libs`、`t-opsem`，每频道最近活跃的 20 个话题。
+长话题最多保留**最近 1000 条消息**，按时间正序展示。摘要仅覆盖实际获取的记录。
+未读以消息 ID 判断，编辑原有消息不会重新标为未读。搜索不包含正文。
+当前是滚动话题列表，不是按日期保存的历史日报。
+
+## 本地开发
+
+需要 Python 3.10+、Node.js 22。Python 脚本仅使用标准库。
+
+```powershell
+npm ci
+python scripts/manual_update.py render
+npm run dev
+```
+
+`render` 使用已提交的 `data/site_snapshot.json`，不访问网络。
+没有真实快照时，可用 `python scripts/make_sample_data.py` 生成明确标注的界面示例。
+不要直接双击 Vue 的 `site/index.html`，也不要用普通 HTTP 服务器运行前端源文件。
+
+```powershell
+npm test
+python -m unittest discover -s tests
+npm run build
+npm run preview
+```
+
+生产产物在 `dist/`。Vite 使用相对资源路径，话题采用 hash 路由，无需服务器路由重写。
 
 ## 目录结构
 
-```
-├── .github/workflows/daily.yml   # 每日定时 + 手动触发的更新与部署
-├── scripts/
-│   ├── pipeline.py               # 主管线：拉取 → 翻译 → 生成站点数据
-│   ├── zulip_client.py           # Zulip API 客户端
-│   ├── translate.py              # OpenAI 兼容翻译 + 缓存 + 代码/URL 保护
-│   └── summarize.py              # 帖子 AI 总结 + 缓存
-├── site/                         # 静态站点（部署到 GitHub Pages）
-│   ├── index.html / app.js / style.css
-│   └── data/*.json               # 每次运行生成的双语数据
-├── data/translation_cache.json   # 翻译缓存（需提交到仓库）
-└── data/summary_cache.json       # 总结缓存（帖子变化时自动更新）
-```
-
-## 快速开始
-
-### 1. 创建 Zulip bot（一次即可）
-
-rust-lang Zulip 的 API 需要登录凭据（即使频道是公开的）：
-
-1. 登录 https://rust-lang.zulipchat.com （没有账号可用 GitHub 账号注册）
-2. 右上角齿轮 → **Personal settings** → **Bots**
-3. 点 **Add a new bot**，类型选 Generic bot，创建后记录 **bot 邮箱**（形如 `xxx-bot@rust-lang.zulipchat.com`）和 **API Key**
-
-### 2. 配置 GitHub Secrets
-
-仓库 → **Settings → Secrets and variables → Actions**：
-
-| 名称 | 必填 | 说明 |
-|---|---|---|
-| `ZULIP_EMAIL` | 是 | Zulip bot 邮箱 |
-| `ZULIP_API_KEY` | 是 | Zulip bot API Key |
-| `OPENAI_API_KEY` | 是 | OpenAI 官方或第三方兼容服务的 API Key |
-| `DEEPL_API_KEY` | 否 | 仅使用 DeepL 或 `deepl+baidu` 降级链时需要 |
-| `BAIDU_APP_ID` | 否 | 仅选择百度翻译后端时需要 |
-| `BAIDU_SECRET_KEY` | 否 | 仅选择百度翻译后端时需要 |
-
-可选 Variables（仓库 Settings → Variables）：
-
-| 名称 | 默认 | 说明 |
-|---|---|---|
-| `TOPICS_PER_STREAM` | `20` | 每频道最新话题数 |
-| `STREAMS` | `general,t-compiler,t-libs,t-opsem` | 自定义频道 |
-| `OPENAI_BASE_URL` | `https://api.openai.com/v1` | 第三方服务请填写其兼容 API 根地址 |
-| `OPENAI_MODEL` | 无 | 服务商提供的模型名称，必须配置 |
-| `AI_CONCURRENCY` | `4` | 同时生成帖子总结的最大请求数；遇到限流可调低 |
-| `MYMEMORY_EMAIL` | 无 | 可选的有效邮箱；MyMemory 用它识别更高的每日配额 |
-| `STREAM_TRANSLATE_BACKENDS` | 见下文 | `频道=后端` 路由，逗号分隔 |
-
-### 3. 启用 GitHub Pages
-
-仓库 → **Settings → Pages** → Source 选择 **GitHub Actions**。（部署脚本会自动处理后续步骤）
-
-### 4. 手动跑一次
-
-仓库 → **Actions** → 左侧 **daily-update** → 右上 **Run workflow**，选择翻译后端后运行：
-
-- `openai`：建议首次运行选择，用配置的模型（例如 `gpt-5.6-luna`）建立高质量翻译缓存。
-- `mymemory`：定时任务的默认选择，后续仅翻译新增或内容发生变化的消息。
-- `mymemory+openai`：优先 MyMemory，失败时自动切换 OpenAI。
-
-完成后访问 `https://<你的用户名>.github.io/<仓库名>/`。翻译缓存与具体后端无关，
-所以切换选项不会重译已有缓存内容；帖子新增发言时，只翻译新增消息，并重新生成该帖总结。
-
-## 本地运行
-
-```bash
-# 1. 安装依赖（仅标准库 + requests 可选，本脚本纯标准库即可）
-python --version
-
-# 2. 配置凭据（Windows PowerShell 示例）
-$env:ZULIP_EMAIL="xxx-bot@rust-lang.zulipchat.com"
-$env:ZULIP_API_KEY="你的APIKey"
-$env:TRANSLATE_BACKEND="mymemory"
-$env:STREAM_TRANSLATE_BACKENDS="general=mymemory,t-compiler=mymemory,t-libs=mymemory,t-opsem=mymemory"
-$env:MYMEMORY_EMAIL="your-valid-email@example.com" # optional
-# 可选：仅使用 DeepL 时设置
-$env:DEEPL_API_KEY="你的 DeepL Key"
-$env:BAIDU_APP_ID="你的百度 APPID"
-$env:BAIDU_SECRET_KEY="你的百度密钥"
-$env:OPENAI_API_KEY="你的 API Key"
-$env:OPENAI_BASE_URL="https://api.openai.com/v1" # 第三方服务改为服务商地址
-$env:OPENAI_MODEL="你的模型名称"
-$env:AI_CONCURRENCY="4"
-
-# 3. 运行管线（拉取 + 翻译 + 生成 site/data/）
-python scripts/pipeline.py
-
-# 4. 本地预览（浏览器打开 http://127.0.0.1:8000）
-cd site && python -m http.server 8000
-```
-
-> 注意：直接用文件双击打开 `index.html` 时浏览器会拦截本地 `fetch`，请用上面的 http.server 方式预览。
-
-## 翻译与 AI 服务配置
-
-默认翻译路由为：
-
 ```text
-general=mymemory,t-compiler=mymemory,t-libs=mymemory,t-opsem=mymemory
+.github/workflows/daily.yml   # publish-site：推送后测试、构建和发布
+docs/UPDATING.md              # 本机获取、人工/代理翻译、审校、推送流程
+scripts/manual_update.py     # prepare / apply / finalize / render
+scripts/zulip_client.py      # 认证和 web-public 只读客户端
+scripts/site_data.py         # 轻量目录与话题正文导出
+scripts/update_report.py     # 翻译与摘要完整性报告
+site/src/                   # Vue 3 + TypeScript 阅读界面
+site/data/                  # 生成数据，不提交
+data/site_snapshot.json     # 提交到 Git 的可发布内容快照
+data/translation_cache.json # 消息与标题翻译缓存
+data/summary_cache.json     # 与原文 digest 对应的摘要缓存
+work/update/                # 本机任务与未完成结果，不提交
+tests/                      # Python 更新流程测试
 ```
 
-可用后端包括 `deepl`、`baidu`、`openai`、`google` 和 `mymemory`。使用 `+` 可以按顺序
-声明降级链，例如 `general=mymemory+openai` 会优先调用 MyMemory，失败时自动改用 OpenAI。
-如要让 `t-opsem` 改用 `gpt-5.6-luna` 翻译，可将对应路由改为 `t-opsem=openai`。
-四个默认频道未被覆盖时保留上述默认路由；其他频道使用 `TRANSLATE_BACKEND`。
+## GitHub Pages
 
-帖子总结固定调用 OpenAI Chat Completions 兼容接口。使用第三方服务时，填写服务商提供的
-API 根地址和模型名称；`OPENAI_MODEL` 可设置为 `gpt-5.6-luna`。
+仓库 Settings → Pages → Source 选择 GitHub Actions。
+`publish-site` 在 main 上推送内容快照或相关代码后运行，也可手动触发。
+它不需要 Zulip、翻译或 OpenAI Secrets，不会自动修改和推送缓存。
+没有完整的新结果时，`finalize` 不会替换快照；已经完成的分批翻译可以保存后继续处理。
 
-代码块、行内代码、URL、邮箱在翻译前会被提取保护，不会被破坏。
+首次改版使用的快照由 `import-published` 从原站迁移，保留原有机器译文及其不足，
+并在快照的 `quality.migrated` 中记录来源。这不代表对既有翻译做了重新审校。
 
-## 常见问题
+## 历史 API 管线
 
-- **首次运行很久？** 首次要翻译并总结几十个话题，属正常；之后翻译和总结都会走缓存。
-- **某条消息只有英文？** 说明该条翻译失败（后端限流/网络），已保留原文，下次运行会自动重试。
-- **想改更新时间？** 编辑 `.github/workflows/daily.yml` 里的 `cron` 表达式（UTC 时区）。
-- **翻译结果想人工校对？** 直接改 `site/data/*.json` 再 push 即可，下次运行会保留人工改过的内容（缓存以消息 id 为准）。
+`scripts/pipeline.py`、`scripts/translate.py` 和 `scripts/summarize.py` 仍保留供单独使用，
+但已退出默认发布流程。若自行运行，按 `.env.example` 设置环境变量，并自行承担服务费用。
+脚本不会自动读取 `.env`。ChatGPT Plus 不能代替脚本所需的 API 凭据。
 
-## 免责声明
+该旧管线已修复 UTF-8 分块、冷却重试、部分成功缓存和长话题读取问题。
+可设置 `REQUIRE_COMPLETE_TRANSLATIONS=true`，在内容不完整时阻止成功退出；
+`OPENAI_TRANSLATION_CHAR_BUDGET` 可限制每次运行请求的翻译原文字符数（0 表示不设限，
+不包含摘要或服务内部重试），`UPDATE_REPORT_PATH` 可指定检查报告位置。
 
-本工具仅供个人学习交流使用；数据版权归 rust-lang 社区及原作者所有。翻译由机器生成，仅供参考。
+人工校对缓存时，应修改对应条目的 `zh` 并保留原始 `en` 和消息键。
+修改生成的 `site/data/` 会被后续 render 覆盖。历史缓存可能含部分英文，不能仅凭缓存存在
+认定其语言质量；有疑问时仍需对照原文审校。
+
+## 说明
+
+数据和发言版权归 rust-lang 社区及原作者所有；翻译和摘要仅供学习参考。
+重要技术结论请核对原帖，尤其注意区分个人意见、提案和已达成的团队决定。
